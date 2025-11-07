@@ -1,0 +1,48 @@
+{
+    "course_title": "AI IN HEALTH CARE APPLICATIONS",
+    "units": [
+        {
+            "unit_number": "I",
+            "unit_title": "INTRODUCTION",
+            "topics": [
+                "AI health care myths",
+                "Human centered AI",
+                "Prescription for Personal Health",
+                "Ambient Computing Healthcare",
+                "Continuous monitoring using AI",
+                "Precision medicine",
+                "Intelligent Personal Health records",
+                "Digital Transformation",
+                "Case Study in Personalized Healthcare"
+            ]
+        },
+        {
+            "unit_number": "II",
+            "unit_title": "AI HEALTHCARE OPERATIONS",
+            "topics": [
+                "AIops strategy",
+                "Clinical Impact of AIops",
+                "Data Analytics and AI",
+                "Design and Innovation",
+                "AIops for Healthcare Delivery",
+                "AIOps for service performance",
+                "HIPAA, PH1, PII Protection",
+                "AIOps Usecase",
+                "Leveraging AIOps for Enhanced IT Operations"
+            ]
+        },
+        {
+            "unit_number": "III",
+            "unit_title": "FUTURE OF HEALTHCARE",
+            "topics": [
+                "Role of Medical Imaging Computing",
+                "AI in Radiology and Practical Use cases",
+                "Chronic Disease Management",
+                "AI Telemedicine",
+                "Telehealth Innovation",
+                "Digital Medication",
+                "Case Study: Cancer diagnostics and treatment decisions"
+            ]
+        }
+    ]
+}
