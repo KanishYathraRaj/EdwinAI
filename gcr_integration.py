@@ -21,14 +21,10 @@ from flask import Blueprint, jsonify, request
 from googleapiclient.errors import HttpError
 from werkzeug.utils import secure_filename
 
+# gcr_integration.py
 @lru_cache(maxsize=1)
 def _cli_module():
-    """Lazy import of the CLI helpers to avoid circular imports."""
-    # Ensure project root is in path to import root main.py
-    project_root = Path(__file__).parent.parent
-    if str(project_root) not in sys.path:
-        sys.path.insert(0, str(project_root))
-    return importlib.import_module("main")
+    return importlib.import_module("gcr_client")
 
 
 def _call(helper_name: str, *args, **kwargs):

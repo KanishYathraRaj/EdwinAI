@@ -63,6 +63,9 @@ def upsert_syllabus_route():
 def upsert_resources_route():
     return resources.upsert_resources(request, chroma_collection, embedder, db)
 
+from gcr_integration import register_gcr_routes
+register_gcr_routes(app)
+
 if __name__ == "__main__":
     app.run(debug=True)
 
