@@ -12,7 +12,7 @@ import resources
 import llm
 import firebase
 import download
-db = firebase.db
+db = firebase.db 
 
 app = Flask(__name__)
 CORS(app)

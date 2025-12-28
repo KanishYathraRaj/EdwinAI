@@ -55,7 +55,7 @@ def upsert_syllabus(client, request, db):
 
         # Send to Gemini
         response = client.models.generate_content(
-            model="gemini-2.0-flash",  # use gemini-2.0-flash if available
+            model="gemini-2.5-flash-lite",  # use gemini-2.0-flash if available
             contents=prompt,
             config={"response_mime_type": "application/json"}
         )
@@ -74,6 +74,8 @@ def upsert_syllabus(client, request, db):
         json_path = pdf_path.replace(".pdf", ".json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
+
+        # print(data)
 
         # Save to Firebase
         db.collection("users").document(user_id) \
