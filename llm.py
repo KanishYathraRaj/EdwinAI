@@ -84,7 +84,7 @@ def ask(client, request, collection, db):
 
         # ✅ Send to Gemini
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash-lite",
             contents=prompt
         )
 
@@ -188,7 +188,7 @@ def generate_question_bank(client, request, collection, db):
 
         # ✅ Send to Gemini
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash-lite",
             contents=prompt
         )
 
@@ -322,7 +322,7 @@ def generate_documentation(client, request, collection, db):
 
         # ✅ Send to Gemini
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash-lite",
             contents=prompt
         )
 
