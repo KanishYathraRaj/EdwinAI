@@ -12,7 +12,7 @@ import resources
 import llm
 import firebase
 import download
-db = firebase.db 
+db = firebase.db
 
 app = Flask(__name__)
 CORS(app)
@@ -62,6 +62,9 @@ def upsert_syllabus_route():
 @app.route("/upsert_resources", methods=["POST"])
 def upsert_resources_route():
     return resources.upsert_resources(request, chroma_collection, embedder, db)
+
+from gcr_integration import register_gcr_routes
+register_gcr_routes(app)
 
 if __name__ == "__main__":
     app.run(debug=True)
