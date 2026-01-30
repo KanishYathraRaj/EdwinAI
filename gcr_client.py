@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Google Classroom helper CLI and reusable functions."""
+"""Google Classroom + Drive + Forms helper functions."""
 
 from __future__ import annotations
 
 import json
 import os
 import sys
-from typing import Dict, List, Optional
+import time
+from typing import Dict, List, Optional, Tuple
 
 from google.oauth2.credentials import Credentials
+from google.auth.exceptions import RefreshError
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -24,29 +26,41 @@ SCOPES = [
     "https://www.googleapis.com/auth/classroom.student-submissions.students.readonly",
     "https://www.googleapis.com/auth/classroom.profile.emails",
     "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/forms.body",
+    "https://www.googleapis.com/auth/forms.responses.readonly",
 ]
 
 TOKEN_FILE = os.path.join(BASE_DIR, "token.json")
 CREDS_FILE = os.path.join(BASE_DIR, "credentials.json")
+INTERACTIVE_AUTH = os.getenv("GCR_INTERACTIVE_AUTH", "false").lower() == "true"
 
 
 def get_creds() -> Credentials:
     """Load stored OAuth credentials or trigger the browser flow."""
-
     creds: Optional[Credentials] = None
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            from google.auth.transport.requests import Request  # lazy import to avoid dependency when unused
-
-            creds.refresh(Request())
+            from google.auth.transport.requests import Request  # lazy import
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                # Token is invalid/expired; remove and force re-auth.
+                try:
+                    os.unlink(TOKEN_FILE)
+                except OSError:
+                    pass
+                raise
         else:
-            if not os.path.exists(CREDS_FILE):
-                raise FileNotFoundError(
-                    "credentials.json not found. Download OAuth client credentials and place here."
+            if not INTERACTIVE_AUTH:
+                raise RefreshError(
+                    "OAuth token missing or invalid and interactive auth is disabled. "
+                    "Set GCR_INTERACTIVE_AUTH=true and re-auth, or run gcr_client.py locally."
                 )
+            if not os.path.exists(CREDS_FILE):
+                raise FileNotFoundError("credentials.json not found. Download OAuth client credentials and place here.")
             flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
             creds = flow.run_local_server(port=0, prompt="consent")
 
@@ -63,6 +77,14 @@ def svc_classroom(creds: Credentials):
 def svc_drive(creds: Credentials):
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
+
+def svc_forms(creds: Credentials):
+    return build("forms", "v1", credentials=creds, cache_discovery=False)
+
+
+# ---------------------------
+# Existing Classroom helpers
+# ---------------------------
 
 def list_courses() -> List[Dict]:
     creds = get_creds()
@@ -87,28 +109,10 @@ def show_course_details(course_id: str) -> None:
     creds = get_creds()
     classroom = svc_classroom(creds)
     course = classroom.courses().get(id=course_id).execute()
-    print(
-        json.dumps(
-            {
-                "id": course["id"],
-                "name": course.get("name"),
-                "section": course.get("section"),
-                "room": course.get("room"),
-                "ownerId": course.get("ownerId"),
-                "state": course.get("courseState"),
-                "descriptionHeading": course.get("descriptionHeading"),
-                "description": course.get("description"),
-                "calendarId": course.get("calendarId"),
-                "courseGroupEmail": course.get("courseGroupEmail"),
-                "teacherGroupEmail": course.get("teacherGroupEmail"),
-                "alternateLink": course.get("alternateLink"),
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps(course, indent=2))
 
 
-def list_students(course_id: str):
+def list_students(course_id: str) -> List[Dict]:
     creds = get_creds()
     classroom = svc_classroom(creds)
     students: List[Dict] = []
@@ -119,20 +123,10 @@ def list_students(course_id: str):
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
-
-    print("gc_user_id\tName\tEmail\tEnrollmentStatus")
-    for student in students:
-        profile = student.get("profile", {})
-        name = profile.get("name", {}).get("fullName")
-        email = profile.get("emailAddress")
-        status = student.get("studentWorkFolder", {}).get("title", "ACTIVE")
-        print(f"{profile.get('id')}\t{name}\t{email}\t{status}")
-
-    print(f"\nTotal students: {len(students)}")
     return students
 
 
-def list_coursework(course_id: str):
+def list_coursework(course_id: str) -> List[Dict]:
     creds = get_creds()
     classroom = svc_classroom(creds)
     items: List[Dict] = []
@@ -143,21 +137,10 @@ def list_coursework(course_id: str):
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
-
-    if not items:
-        print("No coursework found.")
-        return items
-
-    for cw in items:
-        print(
-            f"{cw['id']}\t{cw.get('title')}  ({cw.get('workType')})  "
-            f"state={cw.get('state')}  due={cw.get('dueDate')}"
-        )
-    print(f"\nTotal coursework: {len(items)}")
     return items
 
 
-def list_materials(course_id: str):
+def list_materials(course_id: str) -> List[Dict]:
     creds = get_creds()
     classroom = svc_classroom(creds)
     items: List[Dict] = []
@@ -168,27 +151,6 @@ def list_materials(course_id: str):
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
-
-    if not items:
-        print("No course materials found.")
-        return items
-
-    for material in items:
-        drive_bits: List[str] = []
-        for mat in material.get("materials", []):
-            if "driveFile" in mat:
-                drive_file = mat["driveFile"].get("driveFile", {})
-                drive_bits.append(f"Drive:{drive_file.get('title')} ({drive_file.get('id')})")
-            if "link" in mat:
-                link = mat["link"]
-                drive_bits.append(f"Link:{link.get('title')} {link.get('url')}")
-            if "youtubeVideo" in mat:
-                drive_bits.append(f"YouTube:{mat['youtubeVideo'].get('title')}")
-        print(
-            f"{material['id']}\t{material.get('title')}  state={material.get('state')}  "
-            f"-> {' | '.join(drive_bits)}"
-        )
-    print(f"\nTotal materials: {len(items)}")
     return items
 
 
@@ -204,20 +166,11 @@ def upload_file_to_drive(file_path: str, folder_id: Optional[str] = None) -> str
     if folder_id:
         body["parents"] = [folder_id]
 
-    uploaded = (
-        drive.files()
-        .create(body=body, media_body=media, fields="id, name, webViewLink")
-        .execute()
-    )
-    print(
-        f"Uploaded to Drive: {uploaded.get('name')} ({uploaded['id']})  {uploaded.get('webViewLink')}"
-    )
+    uploaded = drive.files().create(body=body, media_body=media, fields="id, name, webViewLink").execute()
     return uploaded["id"]
 
 
-def post_material_to_class(
-    course_id: str, drive_file_id: str, title: Optional[str] = None, state: str = "PUBLISHED"
-):
+def post_material_to_class(course_id: str, drive_file_id: str, title: Optional[str] = None, state: str = "PUBLISHED") -> Dict:
     creds = get_creds()
     classroom = svc_classroom(creds)
 
@@ -226,27 +179,305 @@ def post_material_to_class(
         "materials": [{"driveFile": {"driveFile": {"id": drive_file_id}}}],
         "state": state,
     }
-    created = (
-        classroom.courses()
-        .courseWorkMaterials()
-        .create(courseId=course_id, body=request_body)
-        .execute()
-    )
-    print(f"Created material: {created.get('id')}  title={created.get('title')}")
-    return created
+    return classroom.courses().courseWorkMaterials().create(courseId=course_id, body=request_body).execute()
+
+
+# ---------------------------
+# NEW: Forms helpers
+# ---------------------------
+
+def _should_retry_http(err: HttpError) -> bool:
+    status = getattr(err.resp, "status", None)
+    return status in (429, 500, 503)
+
+
+def _sleep_backoff(attempt: int):
+    time.sleep(min(0.5 * (2 ** attempt), 4.0))
+
+
+def create_form(title: str) -> Dict:
+    creds = get_creds()
+    forms = svc_forms(creds)
+    return forms.forms().create(body={"info": {"title": title}}).execute()
+
+
+def forms_batch_update_with_retries(
+    form_id: str,
+    requests_payload: List[Dict],
+    max_retries: int = 4,
+    include_form_in_response: bool = False,
+) -> Dict:
+    creds = get_creds()
+    forms = svc_forms(creds)
+
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return forms.forms().batchUpdate(
+                formId=form_id,
+                body={
+                    "requests": requests_payload,
+                    "includeFormInResponse": include_form_in_response,
+                },
+            ).execute()
+        except HttpError as e:
+            last_err = e
+            if _should_retry_http(e) and attempt < max_retries - 1:
+                _sleep_backoff(attempt)
+                continue
+            raise
+    raise last_err  # pragma: no cover
+
+
+def get_form_links(form_id: str) -> Dict:
+    creds = get_creds()
+    forms = svc_forms(creds)
+    form = forms.forms().get(formId=form_id).execute()
+    return {
+        "formId": form_id,
+        "responderUri": form.get("responderUri"),
+        "title": (form.get("info") or {}).get("title"),
+    }
+
+
+def list_form_responses(form_id: str, page_size: int = 500) -> List[Dict]:
+    creds = get_creds()
+    forms = svc_forms(creds)
+
+    responses: List[Dict] = []
+    page_token: Optional[str] = None
+
+    while True:
+        resp = forms.forms().responses().list(
+            formId=form_id,
+            pageSize=page_size,
+            pageToken=page_token,
+        ).execute()
+        responses.extend(resp.get("responses", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    return responses
+
+
+# ---------------------------
+# NEW: Classroom posting (link assignment)
+# ---------------------------
+
+def post_quiz_assignment_link(
+    course_id: str,
+    title: str,
+    url: str,
+    description: str = "",
+    state: str = "PUBLISHED",
+    max_points: Optional[int] = None,
+) -> Dict:
+    """
+    Post to Classroom as ASSIGNMENT containing a LINK to responder URL.
+    This is reliable (no AttachmentNotVisible).
+    """
+    creds = get_creds()
+    classroom = svc_classroom(creds)
+
+    body = {
+        "title": title,
+        "description": description or "",
+        "workType": "ASSIGNMENT",
+        "state": state,
+        "materials": [{"link": {"url": url, "title": title}}],
+    }
+    if max_points is not None:
+        body["maxPoints"] = max_points
+
+    return classroom.courses().courseWork().create(courseId=course_id, body=body).execute()
+
+
+# ---------------------------
+# NEW: Grade refresh + optional push to Classroom
+# ---------------------------
+
+def _extract_identifier_from_response(resp: Dict, identifier_question_id: str) -> Optional[str]:
+    """
+    Identifier is a short answer question; stored in resp['answers'][questionId]['textAnswers']['answers'][0]['value']
+    """
+    answers = resp.get("answers") or {}
+    a = answers.get(identifier_question_id)
+    if not a:
+        return None
+    ta = a.get("textAnswers") or {}
+    arr = ta.get("answers") or []
+    if not arr:
+        return None
+    val = (arr[0] or {}).get("value")
+    if not val:
+        return None
+    return str(val).strip()
+
+
+def _extract_choice_value(resp: Dict, question_id: str) -> Optional[str]:
+    answers = resp.get("answers") or {}
+    a = answers.get(question_id)
+    if not a:
+        return None
+    ta = a.get("textAnswers") or {}
+    arr = ta.get("answers") or []
+    if not arr:
+        return None
+    return (arr[0] or {}).get("value")
+
+
+def compute_scores_from_responses(
+    responses: List[Dict],
+    identifier_question_id: str,
+    answer_key: Dict[str, Dict],
+) -> Dict[str, Dict]:
+    """
+    Returns mapping:
+      identifier_value -> { "score": int, "max": int, "responseId": str, "respondentEmail": str|None }
+    """
+    max_points = sum(int(v.get("points", 0)) for v in answer_key.values())
+
+    out: Dict[str, Dict] = {}
+
+    for r in responses:
+        # Prefer respondentEmail if Forms collected it, else use identifier question answer
+        respondent_email = r.get("respondentEmail")
+        identifier = None
+
+        if respondent_email:
+            identifier = str(respondent_email).strip().lower()
+        else:
+            identifier = _extract_identifier_from_response(r, identifier_question_id)
+            if identifier:
+                identifier = str(identifier).strip().lower()
+
+        if not identifier:
+            continue
+
+        # If quiz graded by Forms, totalScore might exist. But it may be missing if not graded.
+        total_score = r.get("totalScore")
+        if isinstance(total_score, (int, float)):
+            score_val = int(round(float(total_score)))
+        else:
+            score_val = 0
+            for qid, meta in answer_key.items():
+                correct = meta.get("correct")
+                pts = int(meta.get("points", 0))
+                chosen = _extract_choice_value(r, qid)
+                if chosen is not None and correct is not None and str(chosen).strip() == str(correct).strip():
+                    score_val += pts
+
+        out[identifier] = {
+            "score": score_val,
+            "max": max_points,
+            "responseId": r.get("responseId"),
+            "respondentEmail": respondent_email,
+            "lastSubmittedTime": r.get("lastSubmittedTime"),
+        }
+
+    return out
+
+
+def build_email_to_classroom_user_map(course_id: str) -> Dict[str, str]:
+    """
+    email(lowercase) -> classroom userId
+    """
+    students = list_students(course_id)
+    m: Dict[str, str] = {}
+    for s in students:
+        profile = s.get("profile") or {}
+        email = profile.get("emailAddress")
+        uid = profile.get("id")
+        if email and uid:
+            m[str(email).strip().lower()] = str(uid)
+    return m
+
+
+def list_student_submissions(course_id: str, course_work_id: str) -> List[Dict]:
+    creds = get_creds()
+    classroom = svc_classroom(creds)
+
+    subs: List[Dict] = []
+    page_token: Optional[str] = None
+    while True:
+        resp = classroom.courses().courseWork().studentSubmissions().list(
+            courseId=course_id,
+            courseWorkId=course_work_id,
+            pageToken=page_token,
+        ).execute()
+        subs.extend(resp.get("studentSubmissions", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return subs
+
+
+def patch_submission_grade(course_id: str, course_work_id: str, submission_id: str, assigned: int, draft: Optional[int] = None) -> Dict:
+    creds = get_creds()
+    classroom = svc_classroom(creds)
+
+    body = {
+        "assignedGrade": float(assigned),
+        "draftGrade": float(draft if draft is not None else assigned),
+    }
+    return classroom.courses().courseWork().studentSubmissions().patch(
+        courseId=course_id,
+        courseWorkId=course_work_id,
+        id=submission_id,
+        updateMask="assignedGrade,draftGrade",
+        body=body,
+    ).execute()
+
+
+def push_grades_to_classroom_by_email(
+    course_id: str,
+    course_work_id: str,
+    email_scores: Dict[str, Dict],
+) -> Dict:
+    """
+    Attempts to update assigned/draft grades in Classroom for matching students.
+    Returns summary: updated, skipped, errors.
+    """
+    email_to_uid = build_email_to_classroom_user_map(course_id)
+    submissions = list_student_submissions(course_id, course_work_id)
+
+    uid_to_submission_id: Dict[str, str] = {}
+    for sub in submissions:
+        uid = sub.get("userId")
+        sid = sub.get("id")
+        if uid and sid:
+            uid_to_submission_id[str(uid)] = str(sid)
+
+    updated: List[Dict] = []
+    skipped: List[Dict] = []
+    errors: List[Dict] = []
+
+    for email, info in email_scores.items():
+        uid = email_to_uid.get(email)
+        if not uid:
+            skipped.append({"email": email, "reason": "student_not_found_in_classroom"})
+            continue
+        submission_id = uid_to_submission_id.get(uid)
+        if not submission_id:
+            skipped.append({"email": email, "reason": "no_submission_object_in_classroom_yet"})
+            continue
+
+        try:
+            patch_submission_grade(course_id, course_work_id, submission_id, assigned=int(info["score"]))
+            updated.append({"email": email, "userId": uid, "submissionId": submission_id, "score": info["score"]})
+        except HttpError as e:
+            # Classroom might block grade patch depending on submission state / permissions.
+            errors.append({"email": email, "userId": uid, "error": str(e)})
+
+    return {"updated": updated, "skipped": skipped, "errors": errors}
 
 
 def usage() -> None:
     print(
         "Usage:\n"
-        "  python main.py courses\n"
-        "  python main.py course <COURSE_ID>\n"
-        "  python main.py students <COURSE_ID>\n"
-        "  python main.py coursework <COURSE_ID>\n"
-        "  python main.py materials <COURSE_ID>\n"
-        "  python main.py upload <FILE_PATH> [DRIVE_FOLDER_ID]\n"
-        "  python main.py attach <COURSE_ID> <DRIVE_FILE_ID> [TITLE]\n"
-        "  python main.py upload_and_attach <COURSE_ID> <FILE_PATH> [TITLE]\n"
+        "  python gcr_client.py courses\n"
+        "  python gcr_client.py students <COURSE_ID>\n"
     )
 
 
@@ -259,40 +490,15 @@ def _cli() -> None:
 
     try:
         if cmd == "courses":
-            list_courses()
-        elif cmd == "course":
-            show_course_details(sys.argv[2])
+            print(json.dumps(list_courses(), indent=2))
         elif cmd == "students":
-            list_students(sys.argv[2])
-        elif cmd == "coursework":
-            list_coursework(sys.argv[2])
-        elif cmd == "materials":
-            list_materials(sys.argv[2])
-        elif cmd == "upload":
-            file_id = upload_file_to_drive(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
-            print(file_id)
-        elif cmd == "attach":
-            course_id, file_id = sys.argv[2], sys.argv[3]
-            title = sys.argv[4] if len(sys.argv) > 4 else None
-            post_material_to_class(course_id, file_id, title)
-        elif cmd == "upload_and_attach":
-            course_id, file_path = sys.argv[2], sys.argv[3]
-            title = sys.argv[4] if len(sys.argv) > 4 else None
-            file_id = upload_file_to_drive(file_path)
-            post_material_to_class(course_id, file_id, title)
+            print(json.dumps(list_students(sys.argv[2]), indent=2))
         else:
             usage()
             sys.exit(1)
 
     except HttpError as exc:
         print(f"HTTP error: {exc}")
-        if exc.resp is not None:
-            print(f"Status: {exc.resp.status}")
-        if exc.content:
-            try:
-                print(json.dumps(json.loads(exc.content.decode()), indent=2))
-            except Exception:
-                pass
         sys.exit(2)
 
 

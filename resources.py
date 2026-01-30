@@ -42,9 +42,9 @@ def upsert_resources(request, chroma_collection, embedder, db):
 
         db.collection("users").document(user_id) \
             .collection("subjects").document(subject_id) \
-            .update({"resources": firestore.ArrayUnion([
+            .set({"resources": firestore.ArrayUnion([
                 file.filename
-            ])})
+            ])}, merge=True)
         
         print("Stored the Chunks Successfully!!!")
 
