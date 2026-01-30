@@ -2,6 +2,9 @@ from utils import extract_text_from_pdf, chunk_text
 from firebase_admin import firestore
 from flask import jsonify, request as flask_request
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 def upsert_resources(request, chroma_collection, embedder, db):
     try:
@@ -40,11 +43,14 @@ def upsert_resources(request, chroma_collection, embedder, db):
             metadatas=metadatas
         )
 
-        db.collection("users").document(user_id) \
-            .collection("subjects").document(subject_id) \
-            .set({"resources": firestore.ArrayUnion([
-                file.filename
-            ])}, merge=True)
+        try:
+            db.collection("users").document(user_id) \
+                .collection("subjects").document(subject_id) \
+                .set({"resources": firestore.ArrayUnion([
+                    file.filename
+                ])}, merge=True)
+        except Exception as e:
+            logger.exception("Firestore write failed in /upsert_resources: %s", e)
         
         print("Stored the Chunks Successfully!!!")
 

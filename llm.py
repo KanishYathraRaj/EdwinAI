@@ -1,13 +1,80 @@
 from flask import request, jsonify
 import json
 import re
+import logging
 from firebase_admin import firestore
 from google.api_core.exceptions import ResourceExhausted
 from google.auth.exceptions import RefreshError
+from urllib.error import URLError
+
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_json(text: str) -> str:
+    cleaned = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    cleaned = re.sub(r"```$", "", cleaned).strip()
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    if not match:
+        raise ValueError("No JSON structure found in LLM output")
+    raw = match.group(0)
+    # Balance braces/brackets if the model truncated output.
+    open_curly = raw.count("{")
+    close_curly = raw.count("}")
+    if close_curly < open_curly:
+        raw += "}" * (open_curly - close_curly)
+    open_brack = raw.count("[")
+    close_brack = raw.count("]")
+    if close_brack < open_brack:
+        raw += "]" * (open_brack - close_brack)
+    return raw
+
+
+def _safe_json_loads(raw: str):
+    # Try direct parse first.
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    # Heuristic cleanup: strip code fences, trim to outer JSON, remove trailing commas.
+    trimmed = _extract_json(raw)
+    # Insert missing comma before answer_key_plan if needed.
+    trimmed = re.sub(r"(\]|\})\s*\n\s*\"answer_key_plan\"", r"\1,\n  \"answer_key_plan\"", trimmed)
+    trimmed = re.sub(r",\s*([}\]])", r"\1", trimmed)
+    try:
+        return json.loads(trimmed)
+    except Exception:
+        pass
+
+    # Fallback: extract fragments for requests + answer_key_plan and rebuild.
+    def _clean_fragment(text: str) -> str:
+        text = text.strip()
+        text = re.sub(r",\s*([}\]])", r"\1", text)
+        return text
+
+    req_match = re.search(r"\"requests\"\s*:\s*(\[[\s\S]*?\])", trimmed)
+    ak_match = re.search(r"\"answer_key_plan\"\s*:\s*(\{[\s\S]*\})", trimmed)
+    if req_match and ak_match:
+        requests_fragment = _clean_fragment(req_match.group(1))
+        answer_fragment = _clean_fragment(ak_match.group(1))
+        return {
+            "requests": json.loads(requests_fragment),
+            "answer_key_plan": json.loads(answer_fragment),
+        }
+
+    raise ValueError("Failed to parse JSON from LLM output")
 
 
 def _error_response(exc: Exception):
     msg = str(exc)
+    logger.exception("LLM request failed: %s", msg)
+    if isinstance(exc, TimeoutError) or isinstance(exc, URLError):
+        return jsonify({
+            "error": msg,
+            "code": "LLM_TIMEOUT",
+            "hint": "LLM provider timed out. Check Ollama is running and consider increasing OLLAMA_TIMEOUT_SECONDS.",
+        }), 504
     if isinstance(exc, RefreshError) or "invalid_grant" in msg.lower():
         return jsonify({
             "error": msg,
@@ -75,19 +142,17 @@ Context:
 Question: {user_query}
 """
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=prompt
-        )
+        ai_reply = client.generate(prompt)
 
-        ai_reply = response.text.strip()
-
-        db.collection("users").document(user_id) \
-            .collection("subjects").document(subject_id) \
-            .set({"conversation_history": firestore.ArrayUnion([
-                {"role": "user", "message": user_query},
-                {"role": "system", "message": ai_reply}
-            ])}, merge=True)
+        try:
+            db.collection("users").document(user_id) \
+                .collection("subjects").document(subject_id) \
+                .set({"conversation_history": firestore.ArrayUnion([
+                    {"role": "user", "message": user_query},
+                    {"role": "system", "message": ai_reply}
+                ])}, merge=True)
+        except Exception as e:
+            logger.exception("Firestore write failed in /ask: %s", e)
 
         return jsonify({
             "reply": ai_reply,
@@ -149,22 +214,21 @@ Return JSON only:
 }}
 """
 
-        response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-        raw = response.text.strip()
+        raw = client.generate(prompt)
 
-        cleaned = re.sub(r"^```(?:json)?\s*", "", raw)
-        cleaned = re.sub(r"```$", "", cleaned).strip()
-        match = re.search(r"\{[\s\S]*\}", cleaned)
-        if not match:
-            return jsonify({"error": "No JSON structure found in Gemini output", "raw_output": raw}), 500
-
-        data_out = json.loads(match.group(0))
+        try:
+            data_out = _safe_json_loads(raw)
+        except Exception as e:
+            return jsonify({"error": str(e), "raw_output": raw}), 500
         if isinstance(data_out, str):
             data_out = json.loads(data_out)
 
-        db.collection("users").document(user_id).collection("subjects").document(subject_id).set(
-            {"question_bank": data_out}, merge=True
-        )
+        try:
+            db.collection("users").document(user_id).collection("subjects").document(subject_id).set(
+                {"question_bank": data_out}, merge=True
+            )
+        except Exception as e:
+            logger.exception("Firestore write failed in /generate_question_bank: %s", e)
 
         return jsonify({"reply": data_out})
 
@@ -239,8 +303,28 @@ def generate_assessment(client, request, collection, db):
 Return ONLY valid JSON. No markdown. No commentary.
 
 We already created an empty Google Form titled "{quiz_title}".
-Generate a Google Forms API v1 forms.batchUpdate body content (ONLY the "requests" list) to:
+Generate a Google Forms API v1 forms.batchUpdate body content with ONLY these fields:
+- updateSettings.settings.quizSettings.isQuiz
+- updateSettings.updateMask
+- createItem.location.index
+- createItem.item.title
+- createItem.item.questionItem.question.required
+- createItem.item.questionItem.question.textQuestion.paragraph
+- createItem.item.questionItem.question.choiceQuestion.type
+- createItem.item.questionItem.question.choiceQuestion.options[].value
+- createItem.item.questionItem.question.choiceQuestion.shuffle
+- createItem.item.questionItem.question.grading.pointValue
+- createItem.item.questionItem.question.grading.correctAnswers.answers[].value
+- createItem.item.questionItem.question.whenRight.text
+- createItem.item.questionItem.question.whenWrong.text
 
+STRICT RULES:
+- Do NOT invent fields (e.g., "generalAnswerKey" or any unknown keys).
+- Use only keys listed above; any extra key is invalid.
+- Return valid JSON with double quotes and NO trailing commas.
+- No code fences, no prose.
+
+Tasks:
 A) Enable quiz mode
 B) Add ONE first question (short answer) titled "Student email" (required=true)
 C) Add EXACTLY {num_questions} multiple-choice questions (RADIO), each with exactly 4 options.
@@ -280,7 +364,7 @@ Use this exact structure for creating an item:
 
 For MCQ use:
 - question.choiceQuestion.type = "RADIO"
-- question.choiceQuestion.options = [{{"value":"A"}},...]
+- question.choiceQuestion.options = [{{"value":"A"}},{{"value":"B"}},{{"value":"C"}},{{"value":"D"}}]
 - question.choiceQuestion.shuffle = true/false
 
 Return JSON with TWO keys:
@@ -303,25 +387,106 @@ Retrieved: {rag_context}
 {grounded_text}
 """
 
-        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-        raw = (resp.text or "").strip()
+        raw = client.generate(prompt)
 
-        cleaned = re.sub(r"^```(?:json)?\s*", "", raw)
-        cleaned = re.sub(r"```$", "", cleaned).strip()
-        match = re.search(r"\{[\s\S]*\}", cleaned)
-        if not match:
-            return jsonify({"error": "No JSON found in LLM response", "raw_output": raw}), 500
-
-        llm_obj = json.loads(match.group(0))
+        try:
+            llm_obj = _safe_json_loads(raw)
+        except Exception as e:
+            return jsonify({"error": str(e), "raw_output": raw}), 500
         requests_payload = llm_obj.get("requests")
         answer_key_plan = llm_obj.get("answer_key_plan") or {}
 
         if not isinstance(requests_payload, list) or not requests_payload:
             return jsonify({"error": "LLM output must contain non-empty 'requests' list", "raw_output": raw}), 500
 
+        # Normalize malformed question payloads from the LLM to match Forms API schema.
+        for req in requests_payload:
+            # Normalize common snake_case keys to camelCase.
+            if "create_item" in req and "createItem" not in req:
+                req["createItem"] = req.pop("create_item")
+            if "update_settings" in req and "updateSettings" not in req:
+                req["updateSettings"] = req.pop("update_settings")
+
+            create_item = (req or {}).get("createItem") or {}
+            item = create_item.get("item") or {}
+            if "question_item" in item and "questionItem" not in item:
+                item["questionItem"] = item.pop("question_item")
+            qitem = item.get("questionItem") or {}
+            question = qitem.get("question")
+            if not isinstance(question, dict):
+                continue
+
+            if "choice_question" in question and "choiceQuestion" not in question:
+                question["choiceQuestion"] = question.pop("choice_question")
+
+            # Fix common mistake: feedback placed directly on question.
+            when_right = question.pop("whenRight", None)
+            when_wrong = question.pop("whenWrong", None)
+            if when_right or when_wrong:
+                q_grading = question.get("grading") or {}
+                if isinstance(when_right, dict):
+                    q_grading["whenRight"] = when_right
+                if isinstance(when_wrong, dict):
+                    q_grading["whenWrong"] = when_wrong
+                question["grading"] = q_grading
+
+            # Fix common mistake: grading/feedback placed under choiceQuestion.
+            choice = question.get("choiceQuestion")
+            if isinstance(choice, dict):
+                grading = choice.pop("grading", None)
+                when_right = choice.pop("whenRight", None)
+                when_wrong = choice.pop("whenWrong", None)
+                if grading or when_right or when_wrong:
+                    q_grading = question.get("grading") or {}
+                    if isinstance(grading, dict):
+                        q_grading.update(grading)
+                    if isinstance(when_right, dict):
+                        q_grading["whenRight"] = when_right
+                    if isinstance(when_wrong, dict):
+                        q_grading["whenWrong"] = when_wrong
+                    question["grading"] = q_grading
+
+            # Drop any invalid keys accidentally placed on questionItem.
+            for bad_key in ("generalAnswerKey", "answerKey", "general_answer_key"):
+                qitem.pop(bad_key, None)
+
         mcq_plan = answer_key_plan.get("mcq")
         if not isinstance(mcq_plan, list) or len(mcq_plan) != num_questions:
-            return jsonify({"error": "answer_key_plan.mcq must be a list of length num_questions", "raw_output": raw}), 500
+            # Try to recover from malformed LLM output by deriving from requests.
+            derived = []
+            for req in requests_payload:
+                create_item = (req or {}).get("createItem") or {}
+                item = create_item.get("item") or {}
+                qitem = item.get("questionItem") or {}
+                question = qitem.get("question") or {}
+                choice = question.get("choiceQuestion") or {}
+                grading = question.get("grading") or {}
+                correct = ((grading.get("correctAnswers") or {}).get("answers") or [{}])
+                if not choice:
+                    continue
+                correct_val = (correct[0] or {}).get("value")
+                if correct_val is None:
+                    continue
+                derived.append(
+                    {"mcq_index": len(derived), "correct": correct_val, "points": int(grading.get("pointValue", points_per_question))}
+                )
+
+            if len(derived) == 0:
+                return jsonify({
+                    "error": "answer_key_plan.mcq must be a list of length num_questions",
+                    "raw_output": raw,
+                }), 500
+
+            mcq_plan = derived
+
+        mcq_count = len(mcq_plan)
+        if mcq_count != num_questions:
+            logger.warning(
+                "LLM returned %s MCQs but request asked for %s; continuing with %s",
+                mcq_count,
+                num_questions,
+                mcq_count,
+            )
 
         # 3) Apply batchUpdate and include form in response to extract questionIds
         batch_resp = gcr_client.forms_batch_update_with_retries(
@@ -353,15 +518,15 @@ Retrieved: {rag_context}
 
         if identifier_question_id is None:
             return jsonify({"error": "Identifier questionId not found after batchUpdate"}), 500
-        if len(mcq_question_ids) != num_questions:
-            return jsonify({"error": "MCQ count mismatch after batchUpdate", "got": len(mcq_question_ids), "expected": num_questions}), 500
+        if len(mcq_question_ids) != mcq_count:
+            return jsonify({"error": "MCQ count mismatch after batchUpdate", "got": len(mcq_question_ids), "expected": mcq_count}), 500
 
         # Build answer_key dict keyed by questionId
         # answer_key[questionId] = { correct: "...", points: N }
         answer_key = {}
         # validate indices
         idxs = sorted(int(x.get("mcq_index", -1)) for x in mcq_plan if isinstance(x, dict))
-        if idxs != list(range(num_questions)):
+        if idxs != list(range(mcq_count)):
             return jsonify({"error": "mcq_index must be sequential 0..N-1", "got": idxs}), 500
 
         idx_to_plan = {int(x["mcq_index"]): x for x in mcq_plan}
@@ -378,7 +543,7 @@ Retrieved: {rag_context}
         if not responder_uri:
             return jsonify({"error": "Missing responderUri from form"}), 500
 
-        max_points = num_questions * points_per_question
+        max_points = mcq_count * points_per_question
 
         coursework = gcr_client.post_quiz_assignment_link(
             course_id=course_id,
@@ -393,23 +558,26 @@ Retrieved: {rag_context}
 
         # 5) Store metadata (needed for GET refresh endpoint)
         if user_id and subject_id:
-            db.collection("users").document(user_id).collection("subjects").document(subject_id).set(
-                {
-                    "latest_quiz": {
-                        "title": quiz_title,
-                        "description": quiz_description,
-                        "course_id": course_id,
-                        "coursework_id": coursework_id,
-                        "form_id": form_id,
-                        "responder_uri": responder_uri,
-                        "max_points": max_points,
-                        "identifier_question_id": identifier_question_id,
-                        "answer_key": answer_key,
-                        "created_at": firestore.SERVER_TIMESTAMP,
-                    }
-                },
-                merge=True
-            )
+            try:
+                db.collection("users").document(user_id).collection("subjects").document(subject_id).set(
+                    {
+                        "latest_quiz": {
+                            "title": quiz_title,
+                            "description": quiz_description,
+                            "course_id": course_id,
+                            "coursework_id": coursework_id,
+                            "form_id": form_id,
+                            "responder_uri": responder_uri,
+                            "max_points": max_points,
+                            "identifier_question_id": identifier_question_id,
+                            "answer_key": answer_key,
+                            "created_at": firestore.SERVER_TIMESTAMP,
+                        }
+                    },
+                    merge=True
+                )
+            except Exception as e:
+                logger.exception("Firestore write failed in /generate_assessment: %s", e)
 
         return jsonify({
             "ok": True,
@@ -484,22 +652,21 @@ Output format:
 }}
 """
 
-        response = client.models.generate_content(model="gemini-2.5-flash-lite", contents=prompt)
-        raw = response.text.strip()
+        raw = client.generate(prompt)
 
-        cleaned = re.sub(r"^```(?:json)?\s*", "", raw)
-        cleaned = re.sub(r"```$", "", cleaned).strip()
-        match = re.search(r"\{[\s\S]*\}", cleaned)
-        if not match:
-            return jsonify({"error": "No JSON structure found in Gemini output", "raw_output": raw}), 500
-
-        data_out = json.loads(match.group(0))
+        try:
+            data_out = _safe_json_loads(raw)
+        except Exception as e:
+            return jsonify({"error": str(e), "raw_output": raw}), 500
         if isinstance(data_out, str):
             data_out = json.loads(data_out)
 
-        db.collection("users").document(user_id).collection("subjects").document(subject_id).set(
-            {"documentation": data_out}, merge=True
-        )
+        try:
+            db.collection("users").document(user_id).collection("subjects").document(subject_id).set(
+                {"documentation": data_out}, merge=True
+            )
+        except Exception as e:
+            logger.exception("Firestore write failed in /generate_documentation: %s", e)
 
         return jsonify({"reply": data_out})
 

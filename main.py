@@ -1,9 +1,9 @@
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 import fitz  # PyMuPDF
-from google import genai
 import json
 import os
+import logging
 import chromadb
 from sentence_transformers import SentenceTransformer
 
@@ -12,9 +12,11 @@ import resources
 import llm
 import firebase
 import download
+import llm_provider
 db = firebase.db
 
 app = Flask(__name__)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 # Enhanced CORS configuration to handle Cloud Workstations and all origins
 CORS(
     app,
@@ -31,11 +33,7 @@ CORS(
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 )
 
-# Initialize GenAI client with API key from environment
-api_key = os.getenv("GOOGLE_API_KEY")
-if not api_key:
-    raise ValueError("GOOGLE_API_KEY environment variable is not set")
-genai_client = genai.Client(api_key=api_key)
+llm_client = llm_provider.get_llm_client()
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 chroma_client = chromadb.PersistentClient(path="./chromaDB")
 chroma_collection = chroma_client.get_or_create_collection(name="my_collection")
@@ -79,19 +77,19 @@ def favicon():
 
 @app.route("/ask", methods=["POST"])
 def ask_route():
-    return llm.ask(genai_client, request, chroma_collection, db)
+    return llm.ask(llm_client, request, chroma_collection, db)
 
 @app.route("/generate_question_bank", methods=["POST"])
 def generate_question_bank_route():
-    return llm.generate_question_bank(genai_client, request, chroma_collection, db)
+    return llm.generate_question_bank(llm_client, request, chroma_collection, db)
 
 @app.route("/generate_documentation", methods=["POST"])
 def generate_documentation_route():
-    return llm.generate_documentation(genai_client, request, chroma_collection, db)
+    return llm.generate_documentation(llm_client, request, chroma_collection, db)
 
 @app.route("/generate_assessment", methods=["POST"])
 def generate_assessment_route():
-    return llm.generate_assessment(genai_client, request, chroma_collection, db)
+    return llm.generate_assessment(llm_client, request, chroma_collection, db)
 
 @app.route("/download_question_bank", methods=["POST"])
 def generate_pdf():
@@ -115,7 +113,7 @@ def generate_pdf():
 
 @app.route("/upsert_syllabus", methods=["POST"])
 def upsert_syllabus_route():
-    return syllabus.upsert_syllabus(genai_client, request, db)
+    return syllabus.upsert_syllabus(llm_client, request, db)
 
 @app.route("/upsert_resources", methods=["POST"])
 def upsert_resources_route():
@@ -126,4 +124,3 @@ register_gcr_routes(app)
 
 if __name__ == "__main__":
     app.run(debug=True)
-

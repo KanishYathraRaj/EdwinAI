@@ -1,7 +1,10 @@
 from utils import extract_text_from_pdf
 import os
 import json
+import logging
 from flask import jsonify
+
+logger = logging.getLogger(__name__)
 
 def upsert_syllabus(client, request, db):
     try:
@@ -75,12 +78,13 @@ def upsert_syllabus(client, request, db):
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
 
-        # print(data)
-
         # Save to Firebase
-        db.collection("users").document(user_id) \
-        .collection("subjects").document(subject_id) \
-            .set({"syllabus": data}, merge=True)
+        try:
+            db.collection("users").document(user_id) \
+            .collection("subjects").document(subject_id) \
+                .set({"syllabus": data}, merge=True)
+        except Exception as e:
+            logger.exception("Firestore write failed in /upsert_syllabus: %s", e)
 
         return jsonify(data)
 
