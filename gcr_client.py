@@ -35,7 +35,7 @@ CREDS_FILE = os.path.join(BASE_DIR, "credentials.json")
 INTERACTIVE_AUTH = os.getenv("GCR_INTERACTIVE_AUTH", "false").lower() == "true"
 
 
-def get_creds() -> Credentials:
+def get_creds(interactive_override: bool = False) -> Credentials:
     """Load stored OAuth credentials or trigger the browser flow."""
     creds: Optional[Credentials] = None
     if os.path.exists(TOKEN_FILE):
@@ -54,7 +54,8 @@ def get_creds() -> Credentials:
                     pass
                 raise
         else:
-            if not INTERACTIVE_AUTH:
+            is_interactive = INTERACTIVE_AUTH or interactive_override
+            if not is_interactive:
                 raise RefreshError(
                     "OAuth token missing or invalid and interactive auth is disabled. "
                     "Set GCR_INTERACTIVE_AUTH=true and re-auth, or run gcr_client.py locally."
@@ -465,7 +466,7 @@ def push_grades_to_classroom_by_email(
 
         try:
             patch_submission_grade(course_id, course_work_id, submission_id, assigned=int(info["score"]))
-            updated.append({"email": email, "userId": uid, "submissionId": submission_id, "score": info["score"]})
+            updated.append({"email": email, "userId": uid, "submissionId": submission_id, "assignedGrade": info["score"]})
         except HttpError as e:
             # Classroom might block grade patch depending on submission state / permissions.
             errors.append({"email": email, "userId": uid, "error": str(e)})

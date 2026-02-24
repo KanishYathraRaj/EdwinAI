@@ -13,6 +13,9 @@ from flask import Blueprint, jsonify, request
 from googleapiclient.errors import HttpError
 from google.auth.exceptions import RefreshError
 from werkzeug.utils import secure_filename
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Lazy import gcr_client
 @lru_cache(maxsize=1)
@@ -50,12 +53,15 @@ def _handle_auth_error(err: RefreshError):
 @gcr_bp.route("/auth", methods=["POST"])
 def trigger_auth():
     try:
-        creds = _call("get_creds")
+        creds = _call("get_creds", interactive_override=True)
     except HttpError as err:
+        logger.exception("GCR Grades Refresh: HttpError")
         return _handle_http_error(err)
     except RefreshError as err:
+        logger.exception("GCR Grades Refresh: RefreshError")
         return _handle_auth_error(err)
     except Exception as exc:
+        logger.exception("GCR Grades Refresh: Unexpected Error")
         return jsonify({"error": str(exc)}), 500
 
     return jsonify(
@@ -73,10 +79,13 @@ def get_courses():
         courses = _call("list_courses")
         return jsonify({"courses": courses})
     except HttpError as err:
+        logger.exception("GCR Grades Refresh: HttpError")
         return _handle_http_error(err)
     except RefreshError as err:
+        logger.exception("GCR Grades Refresh: RefreshError")
         return _handle_auth_error(err)
     except Exception as exc:
+        logger.exception("GCR Grades Refresh: Unexpected Error")
         return jsonify({"error": str(exc)}), 500
 
 
@@ -88,10 +97,13 @@ def get_course_details(course_id: str):
         course = classroom.courses().get(id=course_id).execute()
         return jsonify(course)
     except HttpError as err:
+        logger.exception("GCR Grades Refresh: HttpError")
         return _handle_http_error(err)
     except RefreshError as err:
+        logger.exception("GCR Grades Refresh: RefreshError")
         return _handle_auth_error(err)
     except Exception as exc:
+        logger.exception("GCR Grades Refresh: Unexpected Error")
         return jsonify({"error": str(exc)}), 500
 
 
@@ -101,10 +113,13 @@ def get_students(course_id: str):
         students = _call("list_students", course_id)
         return jsonify({"students": students})
     except HttpError as err:
+        logger.exception("GCR Grades Refresh: HttpError")
         return _handle_http_error(err)
     except RefreshError as err:
+        logger.exception("GCR Grades Refresh: RefreshError")
         return _handle_auth_error(err)
     except Exception as exc:
+        logger.exception("GCR Grades Refresh: Unexpected Error")
         return jsonify({"error": str(exc)}), 500
 
 
@@ -114,10 +129,13 @@ def get_coursework(course_id: str):
         coursework = _call("list_coursework", course_id)
         return jsonify({"coursework": coursework})
     except HttpError as err:
+        logger.exception("GCR Grades Refresh: HttpError")
         return _handle_http_error(err)
     except RefreshError as err:
+        logger.exception("GCR Grades Refresh: RefreshError")
         return _handle_auth_error(err)
     except Exception as exc:
+        logger.exception("GCR Grades Refresh: Unexpected Error")
         return jsonify({"error": str(exc)}), 500
 
 
@@ -127,10 +145,13 @@ def get_materials(course_id: str):
         materials = _call("list_materials", course_id)
         return jsonify({"materials": materials})
     except HttpError as err:
+        logger.exception("GCR Grades Refresh: HttpError")
         return _handle_http_error(err)
     except RefreshError as err:
+        logger.exception("GCR Grades Refresh: RefreshError")
         return _handle_auth_error(err)
     except Exception as exc:
+        logger.exception("GCR Grades Refresh: Unexpected Error")
         return jsonify({"error": str(exc)}), 500
 
 
@@ -156,10 +177,13 @@ def upload_drive_file():
         drive_id = _call("upload_file_to_drive", tmp_path, folder_id)
         response = {"fileId": drive_id}
     except HttpError as err:
+        logger.exception("GCR Grades Refresh: HttpError")
         return _handle_http_error(err)
     except RefreshError as err:
+        logger.exception("GCR Grades Refresh: RefreshError")
         return _handle_auth_error(err)
     except Exception as exc:
+        logger.exception("GCR Grades Refresh: Unexpected Error")
         return jsonify({"error": str(exc)}), 500
     finally:
         try:
@@ -184,10 +208,13 @@ def attach_drive_file(course_id: str):
         material = _call("post_material_to_class", course_id, drive_file_id, title, state)
         return jsonify(material)
     except HttpError as err:
+        logger.exception("GCR Grades Refresh: HttpError")
         return _handle_http_error(err)
     except RefreshError as err:
+        logger.exception("GCR Grades Refresh: RefreshError")
         return _handle_auth_error(err)
     except Exception as exc:
+        logger.exception("GCR Grades Refresh: Unexpected Error")
         return jsonify({"error": str(exc)}), 500
 
 
@@ -214,10 +241,13 @@ def upload_and_attach(course_id: str):
         material = _call("post_material_to_class", course_id, drive_id, title)
         response = {"fileId": drive_id, "material": material}
     except HttpError as err:
+        logger.exception("GCR Grades Refresh: HttpError")
         return _handle_http_error(err)
     except RefreshError as err:
+        logger.exception("GCR Grades Refresh: RefreshError")
         return _handle_auth_error(err)
     except Exception as exc:
+        logger.exception("GCR Grades Refresh: Unexpected Error")
         return jsonify({"error": str(exc)}), 500
     finally:
         try:
@@ -253,9 +283,10 @@ def fetch_and_store_grades(course_id: str, coursework_id: str):
         if not user_id or not subject_id:
             return jsonify({"error": "user_id and subject_id are required as query params"}), 400
 
-        # Import firestore lazily to avoid circulars
+        # Use the db initialized in main/firebase
+        from firebase import db
         from firebase_admin import firestore
-        db = firestore.client()
+        import firebase_admin
 
         doc_ref = db.collection("users").document(user_id).collection("subjects").document(subject_id)
         snap = doc_ref.get()
@@ -282,15 +313,28 @@ def fetch_and_store_grades(course_id: str, coursework_id: str):
         email_scores = _call("compute_scores_from_responses", responses, identifier_question_id, answer_key)
 
         # 3) store in firestore under latest_quiz.grades
-        grades_obj = {
+        # Use a merge-safe way to ensure latest_quiz exists as a map before dot-updating
+        if not subj.get("latest_quiz"):
+             doc_ref.set({"latest_quiz": {}}, merge=True)
+
+        doc_ref.update({"latest_quiz.grades": {
             "computed_at": firestore.SERVER_TIMESTAMP,
             "course_id": course_id,
             "coursework_id": coursework_id,
             "form_id": form_id,
             "count": len(email_scores),
             "by_email": email_scores,
+        }})
+
+        # Build grades_obj for the response using a friendly string for the timestamp
+        grades_obj = {
+            "computed_at": "SERVER_TIMESTAMP",
+            "course_id": course_id,
+            "coursework_id": coursework_id,
+            "form_id": form_id,
+            "count": len(email_scores),
+            "by_email": email_scores,
         }
-        doc_ref.set({"latest_quiz": {"grades": grades_obj}}, merge=True)
 
         # 4) optionally push to Classroom
         classroom_push = None
@@ -300,17 +344,58 @@ def fetch_and_store_grades(course_id: str, coursework_id: str):
             except Exception as e:
                 classroom_push = {"error": str(e)}
 
+        # Build a list for the frontend that combines form data with classroom push status
+        all_submissions = []
+        pushed_by_email = {}
+        if isinstance(classroom_push, dict) and "updated" in classroom_push:
+            for item in classroom_push["updated"]:
+                if isinstance(item, dict) and "email" in item:
+                    pushed_by_email[item["email"]] = item
+        
+        skipped_by_email = {}
+        if isinstance(classroom_push, dict) and "skipped" in classroom_push:
+            for item in classroom_push["skipped"]:
+                 if isinstance(item, dict) and "email" in item:
+                    skipped_by_email[item["email"]] = item
+
+        for email, info in email_scores.items():
+            sub = {
+                "userId": email, # Default to email for display
+                "assignedGrade": info["score"],
+                "email": email,
+                "submissionId": None,
+                "status": "form_only"
+            }
+            if email in pushed_by_email:
+                sub["userId"] = pushed_by_email[email]["userId"]
+                sub["submissionId"] = pushed_by_email[email]["submissionId"]
+                sub["status"] = "pushed"
+            elif email in skipped_by_email:
+                sub["status"] = "skipped"
+                sub["reason"] = skipped_by_email[email].get("reason")
+            
+            all_submissions.append(sub)
+
+        logger.info(f"Refreshed grades: total Form responses={len(email_scores)}, pushed={len(pushed_by_email)}, skipped={len(skipped_by_email)}")
+
         return jsonify({
             "ok": True,
             "grades": grades_obj,
             "classroom_push": classroom_push,
+            "updated_count": len(pushed_by_email),
+            "skipped_count": len(skipped_by_email),
+            "updated": all_submissions, # Use the merged list for the UI
+            "skipped": classroom_push.get("skipped", []) if classroom_push else [],
         })
 
     except HttpError as err:
+        logger.exception("GCR Grades Refresh: HttpError")
         return _handle_http_error(err)
     except RefreshError as err:
+        logger.exception("GCR Grades Refresh: RefreshError")
         return _handle_auth_error(err)
     except Exception as exc:
+        logger.exception("GCR Grades Refresh: Unexpected Error")
         return jsonify({"error": str(exc)}), 500
 
 

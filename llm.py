@@ -148,8 +148,8 @@ Question: {user_query}
             db.collection("users").document(user_id) \
                 .collection("subjects").document(subject_id) \
                 .set({"conversation_history": firestore.ArrayUnion([
-                    {"role": "user", "message": user_query},
-                    {"role": "system", "message": ai_reply}
+                    {"role": "user", "content": user_query},
+                    {"role": "assistant", "content": ai_reply}
                 ])}, merge=True)
         except Exception as e:
             logger.exception("Firestore write failed in /ask: %s", e)
