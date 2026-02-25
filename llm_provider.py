@@ -4,8 +4,11 @@ import os
 import socket
 import urllib.error
 import urllib.request
+import dotenv
 from dataclasses import dataclass
 from typing import Optional
+
+dotenv.load_dotenv()
 
 
 @dataclass
@@ -14,7 +17,7 @@ class LLMClient:
     model: str
     api_key: Optional[str] = None
     base_url: str = "http://localhost:11434"
-    timeout_seconds: int = 120
+    timeout_seconds: int = 300
     ollama_num_ctx: Optional[int] = None
 
     def generate(self, prompt: str, response_mime_type: Optional[str] = None) -> str:
@@ -93,7 +96,7 @@ def get_llm_client() -> LLMClient:
     provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
     model = os.getenv("LLM_MODEL", "").strip()
     if not model:
-        model = "llama3.1:8b" if provider == "ollama" else "gemini-2.5-flash-lite"
+        model = "llama3.1:8b" if provider == "ollama" else "gemini-flash-latest"
 
     api_key = os.getenv("GOOGLE_API_KEY")
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")

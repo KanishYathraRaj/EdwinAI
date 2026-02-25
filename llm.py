@@ -175,6 +175,12 @@ def generate_question_bank(client, request, collection, db):
         user_id = data.get("user_id")
         subject_id = data.get("subject_id")
         user_subject_json = data.get("user_subject_json", {})
+        selected_topics = data.get("selected_topics", [])
+        difficulty = data.get("difficulty", "Medium")
+        name = data.get("name", "Question Bank")
+        description = data.get("description", "")
+        mark_distribution = data.get("mark_distribution", "")
+        patterns = data.get("patterns", "")
 
         subject_name = user_subject_json.get("subject_name", "")
         syllabus = user_subject_json.get("syllabus", {})
@@ -182,9 +188,11 @@ def generate_question_bank(client, request, collection, db):
 
         rag_context = ""
         if resources:
+            # Query based on selected topics if available for better RAG precision
+            query_text = json.dumps(selected_topics) if selected_topics else json.dumps(syllabus)
             try:
                 results = collection.query(
-                    query_texts=[json.dumps(syllabus, indent=2)],
+                    query_texts=[query_text],
                     n_results=5,
                     where={"resource": {"$in": resources}}
                 )
@@ -197,20 +205,39 @@ def generate_question_bank(client, request, collection, db):
 You are a university-level teaching assistant and question bank generator.
 
 Subject: {subject_name}
+Difficulty Level: {difficulty}
+Target Topics: {", ".join(selected_topics) if selected_topics else "Full Syllabus"}
+Mark Distribution: {mark_distribution or "Balanced"}
+Specific Patterns/Constraints: {patterns or "None"}
 Syllabus: {json.dumps(syllabus, indent=2)}
 Retrieved Study Material: {rag_context}
 
-Return JSON only:
+CRITICAL INSTRUCTIONS:
+1. ONLY generate questions for the topics listed in "Target Topics". If a topic is not in the list, DO NOT include it unless "Full Syllabus" is specified.
+2. The counts and types of questions MUST strictly match the "Mark Distribution" provided. For example, if it says "10 questions of 2 marks", you must provide exactly 10. If it says "5 questions of 16 marks", you must provide exactly 5.
+3. DO NOT separate questions by unit or explicitly mention which topic/unit the question is from. They must be jumbled.
+4. Generate a comprehensive "answer_key" alongside the questions. Every question must have an answer and a reference.
+5. Incorporate the "Specific Patterns/Constraints" into the question style (e.g., use case studies, specific focus areas).
+6. Ensure the complexity and technical depth match the "{difficulty}" difficulty level.
+7. Use the "Retrieved Study Material" as the primary source for technical details and context.
+
+Return JSON only in this exact structure:
 {{
-  "course_title": "",
-  "units": [
-    {{
-      "unit_number": "",
-      "unit_title": "",
-      "2_marks": ["", ""],
-      "16_marks": ["", ""]
-    }}
-  ]
+  "course_title": "{syllabus.get('course_title', subject_name)}",
+  "questions": {{
+    "2_marks": ["Question 1 text...", "Question 2 text..."],
+    "16_marks": ["Question 1 text...", "Question 2 text..."]
+  }},
+  "answer_key": {{
+    "2_marks": [
+      {{"answer": "Answer content...", "references": "Reference material or book..."}},
+      {{"answer": "Answer content...", "references": "Reference material or book..."}}
+    ],
+    "16_marks": [
+      {{"answer": "Answer content...", "references": "Reference material or book..."}},
+      {{"answer": "Answer content...", "references": "Reference material or book..."}}
+    ]
+  }}
 }}
 """
 
@@ -223,14 +250,31 @@ Return JSON only:
         if isinstance(data_out, str):
             data_out = json.loads(data_out)
 
+        import uuid
+        from datetime import datetime
+        
+        qb_id = str(uuid.uuid4())
+        qb_data = {
+            "id": qb_id,
+            "name": name,
+            "description": description,
+            "difficulty": difficulty,
+            "selected_topics": selected_topics,
+            "content": data_out,
+            "created_at": firestore.SERVER_TIMESTAMP
+        }
+
         try:
-            db.collection("users").document(user_id).collection("subjects").document(subject_id).set(
-                {"question_bank": data_out}, merge=True
+            # 1) Keep latest for compatibility
+            db.collection("users").document(user_id).collection("subjects").document(subject_id).update(
+                {"latest_question_bank": qb_data}
             )
+            # 2) Save to history
+            db.collection("users").document(user_id).collection("subjects").document(subject_id).collection("question_banks").document(qb_id).set(qb_data)
         except Exception as e:
             logger.exception("Firestore write failed in /generate_question_bank: %s", e)
 
-        return jsonify({"reply": data_out})
+        return jsonify({"reply": data_out, "id": qb_id})
 
     except Exception as e:
         return _error_response(e)
@@ -328,6 +372,8 @@ Tasks:
 A) Enable quiz mode
 B) Add ONE first question (short answer) titled "Student email" (required=true)
 C) Add EXACTLY {num_questions} multiple-choice questions (RADIO), each with exactly 4 options.
+   - IMPORTANT: You MUST generate EXACTLY {num_questions} questions. No more, no less.
+   - Number each question in the title (e.g. "1. What is...") to ensure you generate exactly {num_questions} questions.
    - required=true
    - shuffle options = {str(shuffle_options).lower()}
    - grading.pointValue = {points_per_question}
@@ -402,32 +448,33 @@ Retrieved: {rag_context}
         # Normalize malformed question payloads from the LLM to match Forms API schema.
         for req in requests_payload:
             # Normalize common snake_case keys to camelCase.
-            if "create_item" in req and "createItem" not in req:
+            if isinstance(req, dict) and "create_item" in req and "createItem" not in req:
                 req["createItem"] = req.pop("create_item")
-            if "update_settings" in req and "updateSettings" not in req:
+            if isinstance(req, dict) and "update_settings" in req and "updateSettings" not in req:
                 req["updateSettings"] = req.pop("update_settings")
 
             create_item = (req or {}).get("createItem") or {}
             item = create_item.get("item") or {}
-            if "question_item" in item and "questionItem" not in item:
+            if isinstance(item, dict) and "question_item" in item and "questionItem" not in item:
                 item["questionItem"] = item.pop("question_item")
             qitem = item.get("questionItem") or {}
             question = qitem.get("question")
             if not isinstance(question, dict):
                 continue
 
-            if "choice_question" in question and "choiceQuestion" not in question:
+            if "choice_question" in question and isinstance(question, dict):
                 question["choiceQuestion"] = question.pop("choice_question")
 
             # Fix common mistake: feedback placed directly on question.
             when_right = question.pop("whenRight", None)
             when_wrong = question.pop("whenWrong", None)
-            if when_right or when_wrong:
+            if (when_right or when_wrong) and isinstance(question, dict):
                 q_grading = question.get("grading") or {}
-                if isinstance(when_right, dict):
-                    q_grading["whenRight"] = when_right
-                if isinstance(when_wrong, dict):
-                    q_grading["whenWrong"] = when_wrong
+                if isinstance(q_grading, dict):
+                    if isinstance(when_right, dict):
+                        q_grading["whenRight"] = when_right
+                    if isinstance(when_wrong, dict):
+                        q_grading["whenWrong"] = when_wrong
                 question["grading"] = q_grading
 
             # Fix common mistake: grading/feedback placed under choiceQuestion.
@@ -436,14 +483,15 @@ Retrieved: {rag_context}
                 grading = choice.pop("grading", None)
                 when_right = choice.pop("whenRight", None)
                 when_wrong = choice.pop("whenWrong", None)
-                if grading or when_right or when_wrong:
+                if (grading or when_right or when_wrong) and isinstance(question, dict):
                     q_grading = question.get("grading") or {}
-                    if isinstance(grading, dict):
-                        q_grading.update(grading)
-                    if isinstance(when_right, dict):
-                        q_grading["whenRight"] = when_right
-                    if isinstance(when_wrong, dict):
-                        q_grading["whenWrong"] = when_wrong
+                    if isinstance(q_grading, dict):
+                        if isinstance(grading, dict):
+                            q_grading.update(grading)
+                        if isinstance(when_right, dict):
+                            q_grading["whenRight"] = when_right
+                        if isinstance(when_wrong, dict):
+                            q_grading["whenWrong"] = when_wrong
                     question["grading"] = q_grading
 
             # Drop any invalid keys accidentally placed on questionItem.
@@ -556,26 +604,31 @@ Retrieved: {rag_context}
 
         coursework_id = coursework.get("id")
 
-        # 5) Store metadata (needed for GET refresh endpoint)
         if user_id and subject_id:
             try:
-                db.collection("users").document(user_id).collection("subjects").document(subject_id).set(
-                    {
-                        "latest_quiz": {
-                            "title": quiz_title,
-                            "description": quiz_description,
-                            "course_id": course_id,
-                            "coursework_id": coursework_id,
-                            "form_id": form_id,
-                            "responder_uri": responder_uri,
-                            "max_points": max_points,
-                            "identifier_question_id": identifier_question_id,
-                            "answer_key": answer_key,
-                            "created_at": firestore.SERVER_TIMESTAMP,
-                        }
-                    },
-                    merge=True
-                )
+                # 1) Keep latest_quiz for easy access/compatibility
+                quiz_data = {
+                    "id": coursework_id or form_id, # Use coursework_id if available
+                    "title": quiz_title,
+                    "description": quiz_description,
+                    "course_id": course_id,
+                    "coursework_id": coursework_id,
+                    "form_id": form_id,
+                    "responder_uri": responder_uri,
+                    "max_points": max_points,
+                    "identifier_question_id": identifier_question_id,
+                    "answer_key": answer_key,
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                }
+                
+                # Update the main subject doc with the latest
+                db.collection("users").document(user_id).collection("subjects").document(subject_id).update({
+                    "latest_quiz": quiz_data
+                })
+                
+                # 2) Save to historical assessments sub-collection
+                db.collection("users").document(user_id).collection("subjects").document(subject_id).collection("assessments").document(coursework_id or form_id).set(quiz_data)
+                
             except Exception as e:
                 logger.exception("Firestore write failed in /generate_assessment: %s", e)
 
@@ -622,13 +675,24 @@ def generate_documentation(client, request, collection, db):
                 rag_context = ""
 
         prompt = f"""
-Return JSON only.
+You are an expert university professor and technical writer. Generate comprehensive, easy-to-understand study documentation for the following subject.
 
 Subject: {subject_name}
 Syllabus: {json.dumps(syllabus, indent=2)}
-Retrieved: {rag_context}
+Retrieved Study Material: {rag_context}
 
-Output format:
+Instructions:
+1. Provide a high-level overview of the course and its importance.
+2. For each unit and topic, provide:
+   - A clear, in-depth explanation of core concepts.
+   - Key formulas, definitions, or theorems where applicable.
+   - Practical examples or case studies.
+   - Real-world applications to provide context.
+   - "Common Pitfalls" - sections explaining what students usually get wrong.
+3. Ensure the tone is academic yet accessible.
+4. If study material is retrieved, prioritize its content while filling gaps with your general knowledge.
+
+Return JSON only in this exact format:
 {{
   "course_title": "string",
   "overview": "string",
@@ -639,16 +703,17 @@ Output format:
       "topics": [
         {{
           "topic_title": "string",
-          "explanation": "text",
-          "examples": ["e1"],
-          "real_world_applications": ["a1"],
-          "summary": "short"
+          "explanation": "structured text with key concepts",
+          "examples": ["e1", "e2"],
+          "real_world_applications": ["a1", "a2"],
+          "pitfalls": ["Common mistake 1", "Common mistake 2"],
+          "summary": "short recap"
         }}
       ],
       "unit_summary": "short"
     }}
   ],
-  "final_summary": "short"
+  "final_summary": "comprehensive closing summary"
 }}
 """
 

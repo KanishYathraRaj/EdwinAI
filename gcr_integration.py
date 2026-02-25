@@ -258,6 +258,44 @@ def upload_and_attach(course_id: str):
     return jsonify(response)
 
 
+@gcr_bp.route("/courses/<course_id>/publish", methods=["POST"])
+def publish_content(course_id: str):
+    """
+    Publishes raw content (markdown/text) to GCR as a material.
+    Body: { "title": "...", "content": "..." }
+    """
+    body = request.get_json(silent=True) or {}
+    title = body.get("title")
+    content = body.get("content")
+
+    if not title or not content:
+        return jsonify({"error": "title and content are required"}), 400
+
+    try:
+        # 1) Upload text to Drive
+        filename = secure_filename(f"{title}.md")
+        drive_id = _call("upload_text_to_drive", content, filename)
+        
+        # 2) Attach Drive file to Classroom as material
+        material = _call("post_material_to_class", course_id, drive_id, title)
+        
+        return jsonify({
+            "ok": True,
+            "drive_id": drive_id,
+            "material_id": material.get("id"),
+            "alternate_link": material.get("alternateLink")
+        })
+    except HttpError as err:
+        logger.exception("GCR Publish: HttpError")
+        return _handle_http_error(err)
+    except RefreshError as err:
+        logger.exception("GCR Publish: RefreshError")
+        return _handle_auth_error(err)
+    except Exception as exc:
+        logger.exception("GCR Publish: Unexpected Error")
+        return jsonify({"error": str(exc)}), 500
+
+
 # -----------------------------
 # NEW: Refresh Grades (GET)
 # -----------------------------
@@ -296,14 +334,30 @@ def fetch_and_store_grades(course_id: str, coursework_id: str):
         subj = snap.to_dict() or {}
         latest = (subj.get("latest_quiz") or {})
 
-        form_id = latest.get("form_id")
-        identifier_question_id = latest.get("identifier_question_id")
-        answer_key = latest.get("answer_key") or {}
+        # 0) Figure out which quiz metadata to use (latest vs historical)
+        quiz_metadata = latest
+        is_latest = (latest.get("coursework_id") == coursework_id)
+        
+        if not is_latest:
+            # Look in sub-collection
+            hist_ref = doc_ref.collection("assessments").document(coursework_id)
+            hist_snap = hist_ref.get()
+            if hist_snap.exists:
+                quiz_metadata = hist_snap.to_dict() or {}
+            else:
+                # If it's a form_id refresh, it might still be historical
+                # But coursework_id is the primary lookup.
+                pass
+
+        form_id = quiz_metadata.get("form_id")
+        identifier_question_id = quiz_metadata.get("identifier_question_id")
+        answer_key = quiz_metadata.get("answer_key") or {}
 
         if not form_id or not identifier_question_id or not answer_key:
             return jsonify({
-                "error": "Missing quiz metadata in Firestore (form_id / identifier_question_id / answer_key)",
-                "latest_quiz": latest
+                "error": f"Missing quiz metadata for {coursework_id} (form_id / identifier_question_id / answer_key)",
+                "quiz_metadata": quiz_metadata,
+                "is_latest": is_latest
             }), 400
 
         # 1) fetch responses
@@ -312,19 +366,30 @@ def fetch_and_store_grades(course_id: str, coursework_id: str):
         # 2) compute scores keyed by email/identifier
         email_scores = _call("compute_scores_from_responses", responses, identifier_question_id, answer_key)
 
-        # 3) store in firestore under latest_quiz.grades
-        # Use a merge-safe way to ensure latest_quiz exists as a map before dot-updating
-        if not subj.get("latest_quiz"):
-             doc_ref.set({"latest_quiz": {}}, merge=True)
-
-        doc_ref.update({"latest_quiz.grades": {
+        # 3) store in firestore 
+        grade_data = {
             "computed_at": firestore.SERVER_TIMESTAMP,
             "course_id": course_id,
             "coursework_id": coursework_id,
             "form_id": form_id,
             "count": len(email_scores),
             "by_email": email_scores,
-        }})
+        }
+        
+        # update historical doc
+        doc_ref.collection("assessments").document(coursework_id).update({
+            "grades": grade_data,
+            "last_synced": firestore.SERVER_TIMESTAMP
+        })
+        
+        # also update latest_quiz if it matches
+        if is_latest:
+            if not subj.get("latest_quiz"):
+                 doc_ref.set({"latest_quiz": {}}, merge=True)
+            doc_ref.update({
+                "latest_quiz.grades": grade_data,
+                "latest_quiz.last_synced": firestore.SERVER_TIMESTAMP
+            })
 
         # Build grades_obj for the response using a friendly string for the timestamp
         grades_obj = {

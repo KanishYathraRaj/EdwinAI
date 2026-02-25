@@ -171,6 +171,53 @@ def upload_file_to_drive(file_path: str, folder_id: Optional[str] = None) -> str
     return uploaded["id"]
 
 
+def upload_text_to_drive(content: str, filename: str, mime_type: str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document", folder_id: Optional[str] = None) -> str:
+    """Uploads markdown text to Drive as a DOCX file."""
+    creds = get_creds()
+    drive = svc_drive(creds)
+
+    import io
+    from googleapiclient.http import MediaIoBaseUpload
+    import docx
+
+    # Basic markdown to docx conversion
+    doc = docx.Document()
+    for line in content.split('\n'):
+        line_s = line.strip()
+        if not line_s:
+            continue
+        if line_s.startswith('# '):
+            doc.add_heading(line_s[2:], 1)
+        elif line_s.startswith('## '):
+            doc.add_heading(line_s[3:], 2)
+        elif line_s.startswith('### '):
+            doc.add_heading(line_s[4:], 3)
+        elif line_s.startswith('- '):
+            doc.add_paragraph(line_s[2:], style='List Bullet')
+        else:
+            doc.add_paragraph(line_s)
+    
+    fh = io.BytesIO()
+    doc.save(fh)
+    fh.seek(0)
+    
+    # Ensure filename ends with .docx
+    if not filename.endswith('.docx'):
+        # replace extension if exists, else append
+        if '.' in filename:
+            filename = filename.rsplit('.', 1)[0] + '.docx'
+        else:
+            filename += '.docx'
+
+    media = MediaIoBaseUpload(fh, mimetype=mime_type, resumable=True)
+    body = {"name": filename}
+    if folder_id:
+        body["parents"] = [folder_id]
+
+    uploaded = drive.files().create(body=body, media_body=media, fields="id").execute()
+    return uploaded["id"]
+
+
 def post_material_to_class(course_id: str, drive_file_id: str, title: Optional[str] = None, state: str = "PUBLISHED") -> Dict:
     creds = get_creds()
     classroom = svc_classroom(creds)

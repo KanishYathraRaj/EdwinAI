@@ -4,4 +4,4 @@ __pycache__
 /data
 token.json
 *.json.bak
-chromaDB
+/chromaDB/

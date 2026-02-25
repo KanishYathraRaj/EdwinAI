@@ -17,6 +17,7 @@ db = firebase.db
 
 app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
 # Enhanced CORS configuration to handle Cloud Workstations and all origins
 CORS(
     app,
@@ -33,10 +34,41 @@ CORS(
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 )
 
+import time
+@app.before_request
+def start_timer():
+    request.start_time = time.time()
+    logger.info("Request started: %s %s", request.method, request.path)
+
+@app.after_request
+def log_request(response):
+    if hasattr(request, 'start_time'):
+        duration = time.time() - request.start_time
+        logger.info("Request finished: %s %s, Duration: %.2fs, Status: %s", 
+                    request.method, request.path, duration, response.status)
+    return response
+
 llm_client = llm_provider.get_llm_client()
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+embedder = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
 chroma_client = chromadb.PersistentClient(path="./chromaDB")
 chroma_collection = chroma_client.get_or_create_collection(name="my_collection")
+
+# Store shared dependencies in app.config for blueprints to access
+app.config['LLM_CLIENT'] = llm_client
+app.config['CHROMA_COLLECTION'] = chroma_collection
+app.config['FIREBASE_DB'] = db
+app.config['EMBEDDER'] = embedder
+
+# Register Blueprints
+from blueprints.llm_bp import llm_bp
+from blueprints.syllabus_bp import syllabus_bp
+from blueprints.resources_bp import resources_bp
+from gcr_integration import gcr_bp
+
+app.register_blueprint(llm_bp)
+app.register_blueprint(syllabus_bp)
+app.register_blueprint(resources_bp)
+app.register_blueprint(gcr_bp)
 
 
 @app.after_request
@@ -56,15 +88,10 @@ def root():
         "message": "EdwinAI API Server",
         "status": "running",
         "endpoints": {
-            "ask": "POST /ask",
-            "generate_question_bank": "POST /generate_question_bank",
-            "generate_documentation": "POST /generate_documentation",
-            "generate_assessment": "POST /generate_assessment",
-            "download_question_bank": "POST /download_question_bank",
-            "upsert_syllabus": "POST /upsert_syllabus",
-            "upsert_resources": "POST /upsert_resources",
-            "gcr_courses": "GET /gcr/courses",
-            "gcr_students": "GET /gcr/courses/<course_id>/students",
+            "llm": ["/ask", "/generate_question_bank", "/generate_documentation", "/generate_assessment", "/download_question_bank"],
+            "syllabus": ["/upsert_syllabus"],
+            "resources": ["/upsert_resources"],
+            "gcr": ["/gcr/auth", "/gcr/courses", "/gcr/courses/<id>/students", "..."],
         }
     })
 
@@ -74,53 +101,5 @@ def favicon():
     """Handle favicon requests."""
     return "", 204  # No Content
 
-
-@app.route("/ask", methods=["POST"])
-def ask_route():
-    return llm.ask(llm_client, request, chroma_collection, db)
-
-@app.route("/generate_question_bank", methods=["POST"])
-def generate_question_bank_route():
-    return llm.generate_question_bank(llm_client, request, chroma_collection, db)
-
-@app.route("/generate_documentation", methods=["POST"])
-def generate_documentation_route():
-    return llm.generate_documentation(llm_client, request, chroma_collection, db)
-
-@app.route("/generate_assessment", methods=["POST"])
-def generate_assessment_route():
-    return llm.generate_assessment(llm_client, request, chroma_collection, db)
-
-@app.route("/download_question_bank", methods=["POST"])
-def generate_pdf():
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No JSON data provided"}), 400
-
-        pdf_buffer = download.question_bank_to_pdf(data)
-        filename = data.get("course_title", "question_bank").replace(" ", "_") + ".pdf"
-
-        return send_file(
-            pdf_buffer,
-            as_attachment=True,
-            download_name=filename,
-            mimetype="application/pdf"
-        )
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/upsert_syllabus", methods=["POST"])
-def upsert_syllabus_route():
-    return syllabus.upsert_syllabus(llm_client, request, db)
-
-@app.route("/upsert_resources", methods=["POST"])
-def upsert_resources_route():
-    return resources.upsert_resources(request, chroma_collection, embedder, db)
-
-from gcr_integration import register_gcr_routes
-register_gcr_routes(app)
-
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, port=5005, use_reloader=False)

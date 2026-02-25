@@ -47,21 +47,43 @@ def question_bank_to_pdf(data):
     elements.append(Paragraph(data.get("course_title", "Question Bank"), title_style))
     elements.append(Spacer(1, 12))
 
-    # Add all units
-    for unit in data.get("units", []):
-        unit_heading = f"UNIT {unit.get('unit_number', '')}: {unit.get('unit_title', '')}"
-        elements.append(Paragraph(unit_heading, unit_title_style))
-        elements.append(Spacer(1, 6))
+    # Add Question Bank
+    if "questions" in data:
+        q_data = data["questions"]
+        if "2_marks" in q_data and q_data["2_marks"]:
+            elements.append(Paragraph("📘 2 MARK QUESTIONS", qtype_style))
+            for i, q in enumerate(q_data["2_marks"], 1):
+                elements.append(Paragraph(f"{i}. {q}", question_style))
+            elements.append(Spacer(1, 12))
 
-        elements.append(Paragraph("📘 2 MARK QUESTIONS", qtype_style))
-        for i, q in enumerate(unit.get("2_marks", []), 1):
-            elements.append(Paragraph(f"{i}. {q}", question_style))
+        if "16_marks" in q_data and q_data["16_marks"]:
+            elements.append(Paragraph("🧠 16 MARK QUESTIONS", qtype_style))
+            for i, q in enumerate(q_data["16_marks"], 1):
+                elements.append(Paragraph(f"{i}. {q}", question_style))
+            elements.append(PageBreak())
+
+    # Add Answer Key
+    if "answer_key" in data:
+        elements.append(Paragraph("🔑 ANSWER KEY", title_style))
         elements.append(Spacer(1, 12))
+        ak_data = data["answer_key"]
+        if "2_marks" in ak_data and ak_data["2_marks"]:
+            elements.append(Paragraph("📘 2 MARK ANSWERS", qtype_style))
+            for i, ans in enumerate(ak_data["2_marks"], 1):
+                elements.append(Paragraph(f"<b>Question {i}</b>", question_style))
+                elements.append(Paragraph(ans.get("answer", ""), question_style))
+                elements.append(Paragraph(f"<i>Reference: {ans.get('references', '')}</i>", ParagraphStyle('Ref', parent=question_style, fontSize=9, textColor="#7F8C8D")))
+                elements.append(Spacer(1, 6))
+            elements.append(Spacer(1, 12))
 
-        elements.append(Paragraph("🧠 16 MARK QUESTIONS", qtype_style))
-        for i, q in enumerate(unit.get("16_marks", []), 1):
-            elements.append(Paragraph(f"{i}. {q}", question_style))
-        elements.append(PageBreak())
+        if "16_marks" in ak_data and ak_data["16_marks"]:
+            elements.append(Paragraph("🧠 16 MARK ANSWERS", qtype_style))
+            for i, ans in enumerate(ak_data["16_marks"], 1):
+                elements.append(Paragraph(f"<b>Question {i}</b>", question_style))
+                elements.append(Paragraph(ans.get("answer", ""), question_style))
+                elements.append(Paragraph(f"<i>Reference: {ans.get('references', '')}</i>", ParagraphStyle('Ref', parent=question_style, fontSize=9, textColor="#7F8C8D")))
+                elements.append(Spacer(1, 6))
+            elements.append(PageBreak())
 
     doc.build(elements)
     buffer.seek(0)
