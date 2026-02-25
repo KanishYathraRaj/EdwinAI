@@ -1,9 +1,9 @@
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 import fitz  # PyMuPDF
-from google import genai
 import json
 import os
+import logging
 import chromadb
 from sentence_transformers import SentenceTransformer
 
@@ -12,60 +12,94 @@ import resources
 import llm
 import firebase
 import download
+import llm_provider
 db = firebase.db
 
 app = Flask(__name__)
-CORS(app)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
+# Enhanced CORS configuration to handle Cloud Workstations and all origins
+CORS(
+    app,
+    resources={r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        "allow_headers": "*",
+        "expose_headers": "*",
+        "supports_credentials": True,
+    }},
+    supports_credentials=True,
+    allow_headers="*",
+    expose_headers="*",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
 
-genai_client = genai.Client()
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+import time
+@app.before_request
+def start_timer():
+    request.start_time = time.time()
+    logger.info("Request started: %s %s", request.method, request.path)
+
+@app.after_request
+def log_request(response):
+    if hasattr(request, 'start_time'):
+        duration = time.time() - request.start_time
+        logger.info("Request finished: %s %s, Duration: %.2fs, Status: %s", 
+                    request.method, request.path, duration, response.status)
+    return response
+
+llm_client = llm_provider.get_llm_client()
+embedder = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
 chroma_client = chromadb.PersistentClient(path="./chromaDB")
 chroma_collection = chroma_client.get_or_create_collection(name="my_collection")
 
+# Store shared dependencies in app.config for blueprints to access
+app.config['LLM_CLIENT'] = llm_client
+app.config['CHROMA_COLLECTION'] = chroma_collection
+app.config['FIREBASE_DB'] = db
+app.config['EMBEDDER'] = embedder
 
-@app.route("/ask", methods=["POST"])
-def ask_route():
-    return llm.ask(genai_client, request, chroma_collection, db)
+# Register Blueprints
+from blueprints.llm_bp import llm_bp
+from blueprints.syllabus_bp import syllabus_bp
+from blueprints.resources_bp import resources_bp
+from gcr_integration import gcr_bp
 
-@app.route("/generate_question_bank", methods=["POST"])
-def generate_question_bank_route():
-    return llm.generate_question_bank(genai_client, request, chroma_collection, db)
+app.register_blueprint(llm_bp)
+app.register_blueprint(syllabus_bp)
+app.register_blueprint(resources_bp)
+app.register_blueprint(gcr_bp)
 
-@app.route("/generate_documentation", methods=["POST"])
-def generate_documentation_route():
-    return llm.generate_documentation(genai_client, request, chroma_collection, db)
 
-@app.route("/download_question_bank", methods=["POST"])
-def generate_pdf():
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No JSON data provided"}), 400
+@app.after_request
+def after_request(response):
+    """Ensure CORS headers are always set."""
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', '*')
+    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    return response
 
-        pdf_buffer = download.question_bank_to_pdf(data)
-        filename = data.get("course_title", "question_bank").replace(" ", "_") + ".pdf"
 
-        return send_file(
-            pdf_buffer,
-            as_attachment=True,
-            download_name=filename,
-            mimetype="application/pdf"
-        )
+@app.route("/", methods=["GET"])
+def root():
+    """Root endpoint with API information."""
+    return jsonify({
+        "message": "EdwinAI API Server",
+        "status": "running",
+        "endpoints": {
+            "llm": ["/ask", "/generate_question_bank", "/generate_documentation", "/generate_assessment", "/download_question_bank"],
+            "syllabus": ["/upsert_syllabus"],
+            "resources": ["/upsert_resources"],
+            "gcr": ["/gcr/auth", "/gcr/courses", "/gcr/courses/<id>/students", "..."],
+        }
+    })
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
-@app.route("/upsert_syllabus", methods=["POST"])
-def upsert_syllabus_route():
-    return syllabus.upsert_syllabus(genai_client, request, db)
-
-@app.route("/upsert_resources", methods=["POST"])
-def upsert_resources_route():
-    return resources.upsert_resources(request, chroma_collection, embedder, db)
-
-from gcr_integration import register_gcr_routes
-register_gcr_routes(app)
+@app.route("/favicon.ico", methods=["GET"])
+def favicon():
+    """Handle favicon requests."""
+    return "", 204  # No Content
 
 if __name__ == "__main__":
-    app.run(debug=True)
-
+    app.run(debug=True, port=5005, use_reloader=False)

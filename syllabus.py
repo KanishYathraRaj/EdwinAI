@@ -1,7 +1,10 @@
 from utils import extract_text_from_pdf
 import os
 import json
+import logging
 from flask import jsonify
+
+logger = logging.getLogger(__name__)
 
 def upsert_syllabus(client, request, db):
     try:
@@ -30,37 +33,42 @@ def upsert_syllabus(client, request, db):
 
         # Prepare prompt
         prompt = f"""
-        You are an assistant that extracts only the syllabus topics and subtopics from a document.
-
-        Here is the text extracted from a syllabus PDF:
-        ---
-        {pdf_text}
-        ---
-
-        Please:
-        1. Ignore non-syllabus text like page numbers, headers, or footers.
-        2. Identify course title, units, and topics.
-        3. Return the result strictly in JSON format:
+        You are an expert academic assistant specializing in syllabus parsing.
+        Extract the course structure from the provided text into a highly structured nested JSON.
+        
+        Rules:
+        1. Identify the Course Title.
+        2. Group content into Units/Modules.
+        3. For each Unit, identify main Topics.
+        4. For each Topic, identify Sub-topics (if any).
+        5. MAX DENSITY: Ensure topics and sub-topics are granular. If a topic is too broad, break it down. Aim for 3-7 sub-topics per main topic to provide a detailed learning path.
+        6. IGNORE: Page numbers, faculty names, office hours, grading policies, or administrative text.
+        
+        JSON Structure:
         {{
-          "course_title": "",
+          "course_title": "Full Name of Course",
           "units": [
             {{
-              "unit_number": "",
-              "unit_title": "",
-              "topics": ["", "", ""]
+              "unit_number": "Unit 1",
+              "unit_title": "Title of Unit",
+              "topics": [
+                {{
+                  "title": "Main Topic Name",
+                  "subtopics": ["Subtopic A", "Subtopic B"]
+                }}
+              ]
             }}
           ]
         }}
+
+        Extracted Text:
+        ---
+        {pdf_text}
+        ---
         """
 
         # Send to Gemini
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",  # use gemini-2.0-flash if available
-            contents=prompt,
-            config={"response_mime_type": "application/json"}
-        )
-
-        raw = response.text
+        raw = client.generate(prompt, response_mime_type="application/json")
 
         # Handle possible double-encoded JSON
         try:
@@ -75,12 +83,13 @@ def upsert_syllabus(client, request, db):
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
 
-        # print(data)
-
         # Save to Firebase
-        db.collection("users").document(user_id) \
-        .collection("subjects").document(subject_id) \
-            .set({"syllabus": data}, merge=True)
+        try:
+            db.collection("users").document(user_id) \
+            .collection("subjects").document(subject_id) \
+                .set({"syllabus": data}, merge=True)
+        except Exception as e:
+            logger.exception("Firestore write failed in /upsert_syllabus: %s", e)
 
         return jsonify(data)
 

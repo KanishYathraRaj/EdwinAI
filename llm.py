@@ -1,103 +1,159 @@
-from flask import Flask, request, jsonify
+from flask import request, jsonify
 import json
-from firebase_admin import firestore
 import re
+import logging
+from firebase_admin import firestore
+from google.api_core.exceptions import ResourceExhausted
+from google.auth.exceptions import RefreshError
+from urllib.error import URLError
+
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_json(text: str) -> str:
+    cleaned = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    cleaned = re.sub(r"```$", "", cleaned).strip()
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    if not match:
+        raise ValueError("No JSON structure found in LLM output")
+    raw = match.group(0)
+    # Balance braces/brackets if the model truncated output.
+    open_curly = raw.count("{")
+    close_curly = raw.count("}")
+    if close_curly < open_curly:
+        raw += "}" * (open_curly - close_curly)
+    open_brack = raw.count("[")
+    close_brack = raw.count("]")
+    if close_brack < open_brack:
+        raw += "]" * (open_brack - close_brack)
+    return raw
+
+
+def _safe_json_loads(raw: str):
+    # Try direct parse first.
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    # Heuristic cleanup: strip code fences, trim to outer JSON, remove trailing commas.
+    trimmed = _extract_json(raw)
+    # Insert missing comma before answer_key_plan if needed.
+    trimmed = re.sub(r"(\]|\})\s*\n\s*\"answer_key_plan\"", r"\1,\n  \"answer_key_plan\"", trimmed)
+    trimmed = re.sub(r",\s*([}\]])", r"\1", trimmed)
+    try:
+        return json.loads(trimmed)
+    except Exception:
+        pass
+
+    # Fallback: extract fragments for requests + answer_key_plan and rebuild.
+    def _clean_fragment(text: str) -> str:
+        text = text.strip()
+        text = re.sub(r",\s*([}\]])", r"\1", text)
+        return text
+
+    req_match = re.search(r"\"requests\"\s*:\s*(\[[\s\S]*?\])", trimmed)
+    ak_match = re.search(r"\"answer_key_plan\"\s*:\s*(\{[\s\S]*\})", trimmed)
+    if req_match and ak_match:
+        requests_fragment = _clean_fragment(req_match.group(1))
+        answer_fragment = _clean_fragment(ak_match.group(1))
+        return {
+            "requests": json.loads(requests_fragment),
+            "answer_key_plan": json.loads(answer_fragment),
+        }
+
+    raise ValueError("Failed to parse JSON from LLM output")
+
+
+def _error_response(exc: Exception):
+    msg = str(exc)
+    logger.exception("LLM request failed: %s", msg)
+    if isinstance(exc, TimeoutError) or isinstance(exc, URLError):
+        return jsonify({
+            "error": msg,
+            "code": "LLM_TIMEOUT",
+            "hint": "LLM provider timed out. Check Ollama is running and consider increasing OLLAMA_TIMEOUT_SECONDS.",
+        }), 504
+    if isinstance(exc, RefreshError) or "invalid_grant" in msg.lower():
+        return jsonify({
+            "error": msg,
+            "code": "INVALID_GRANT",
+            "hint": "OAuth token is invalid/expired. Delete token.json and re-auth via /gcr/auth or run gcr_client.py.",
+        }), 401
+    if isinstance(exc, ResourceExhausted) or "RESOURCE_EXHAUSTED" in msg:
+        return jsonify({"error": msg, "code": "RESOURCE_EXHAUSTED"}), 429
+    return jsonify({"error": msg}), 500
+
 
 def ask(client, request, collection, db):
     try:
         data = request.get_json()
 
-        # Extract incoming data
         user_query = data.get("user_query")
         user_id = data.get("user_id")
         subject_id = data.get("subject_id")
         user_subject_json = data.get("user_subject_json", {})
         grounded = data.get("grounded")
 
-        
-
-        # Separate data
         subject_name = user_subject_json.get("subject_name", "")
         syllabus = user_subject_json.get("syllabus", {})
         resources = user_subject_json.get("resources", [])
         conversation_history = user_subject_json.get("conversation_history", [])
 
-        # print(f"User ID: {user_id}")
-        # print(f"Subject ID: {subject_id}")
-        print(f"Resources (filters): {resources}")
-        print("Grounded : ", grounded)
         grounded_text = ""
-        if grounded == False :
+        if grounded is False:
             grounded_text = "if the retrived study material is empty then generate based on your current level of knowledge"
 
-
-        # ✅ Fetch RAG context from Chroma based on resource metadata
         rag_context = ""
         if resources:
             try:
                 results = collection.query(
                     query_texts=[user_query],
                     n_results=5,
-                    where={"resources": {"$in": resources}}  # metadata filter
+                    where={"resources": {"$in": resources}}
                 )
-
                 rag_docs = results.get("documents", [[]])[0]
                 rag_context = "\n\n".join(rag_docs)
-                print(rag_context)
-                print("RAG Context Retrieved ✅")
-            except Exception as e:
-                print(f"RAG fetch failed: {e}")
+            except Exception:
                 rag_context = ""
-        else:
-            rag_context = ""
 
-        # ✅ Combine everything into the final prompt
         context = f"""
-        Subject: {subject_name}
-
-        Course Title: {syllabus.get('course_title', '')}
-
-        Units:
-        {json.dumps(syllabus.get('units', []), indent=2)}
-
-        Resources (metadata filters): {', '.join(resources)}
-
-        Previous Conversation:
-        {json.dumps(conversation_history[-10:], indent=2)}
-
-        Retrieved Study Material from ChromaDB:
-        {rag_context}
-
-        {grounded_text}
-        """
+Subject: {subject_name}
+Course Title: {syllabus.get('course_title', '')}
+Units:
+{json.dumps(syllabus.get('units', []), indent=2)}
+Resources (metadata filters): {', '.join(resources)}
+Previous Conversation:
+{json.dumps(conversation_history[-10:], indent=2)}
+Retrieved Study Material from ChromaDB:
+{rag_context}
+{grounded_text}
+"""
 
         prompt = f"""
-        You are an intelligent teaching assistant.
-        Use the syllabus, resources, and retrieved content below to answer precisely.
-        don't add markdown styles in the generated content
+You are an intelligent teaching assistant.
+Use the syllabus, resources, and retrieved content below to answer precisely.
+don't add markdown styles in the generated content
 
-        Context:
-        {context}
+Context:
+{context}
 
-        Question: {user_query}
-        """
+Question: {user_query}
+"""
 
-        # ✅ Send to Gemini
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=prompt
-        )
+        ai_reply = client.generate(prompt)
 
-        ai_reply = response.text.strip()
+        try:
+            db.collection("users").document(user_id) \
+                .collection("subjects").document(subject_id) \
+                .set({"conversation_history": firestore.ArrayUnion([
+                    {"role": "user", "content": user_query},
+                    {"role": "assistant", "content": ai_reply}
+                ])}, merge=True)
+        except Exception as e:
+            logger.exception("Firestore write failed in /ask: %s", e)
 
-        db.collection("users").document(user_id) \
-            .collection("subjects").document(subject_id) \
-            .update({"conversation_history": firestore.ArrayUnion([
-                {"role": "user", "message": user_query},
-                {"role": "system", "message": ai_reply}
-            ])})
-
-        # Return the combined result
         return jsonify({
             "reply": ai_reply,
             "user_id": user_id,
@@ -109,265 +165,575 @@ def ask(client, request, collection, db):
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
+
 
 def generate_question_bank(client, request, collection, db):
     try:
         data = request.get_json()
 
-        # Extract incoming data
         user_id = data.get("user_id")
         subject_id = data.get("subject_id")
         user_subject_json = data.get("user_subject_json", {})
+        selected_topics = data.get("selected_topics", [])
+        difficulty = data.get("difficulty", "Medium")
+        name = data.get("name", "Question Bank")
+        description = data.get("description", "")
+        mark_distribution = data.get("mark_distribution", "")
+        patterns = data.get("patterns", "")
 
-        # Separate data
         subject_name = user_subject_json.get("subject_name", "")
         syllabus = user_subject_json.get("syllabus", {})
         resources = user_subject_json.get("resources", [])
 
-        print(f"User ID: {user_id}")
-        print(f"Subject ID: {subject_id}")
-        print(f"Resources (filters): {resources}")
+        rag_context = ""
+        if resources:
+            # Query based on selected topics if available for better RAG precision
+            query_text = json.dumps(selected_topics) if selected_topics else json.dumps(syllabus)
+            try:
+                results = collection.query(
+                    query_texts=[query_text],
+                    n_results=5,
+                    where={"resource": {"$in": resources}}
+                )
+                rag_docs = results.get("documents", [[]])[0]
+                rag_context = "\n\n".join(rag_docs)
+            except Exception:
+                rag_context = ""
 
-        # ✅ Fetch RAG context from Chroma based on resource metadata
+        prompt = f"""
+You are a university-level teaching assistant and question bank generator.
+
+Subject: {subject_name}
+Difficulty Level: {difficulty}
+Target Topics: {", ".join(selected_topics) if selected_topics else "Full Syllabus"}
+Mark Distribution: {mark_distribution or "Balanced"}
+Specific Patterns/Constraints: {patterns or "None"}
+Syllabus: {json.dumps(syllabus, indent=2)}
+Retrieved Study Material: {rag_context}
+
+CRITICAL INSTRUCTIONS:
+1. ONLY generate questions for the topics listed in "Target Topics". If a topic is not in the list, DO NOT include it unless "Full Syllabus" is specified.
+2. The counts and types of questions MUST strictly match the "Mark Distribution" provided. For example, if it says "10 questions of 2 marks", you must provide exactly 10. If it says "5 questions of 16 marks", you must provide exactly 5.
+3. DO NOT separate questions by unit or explicitly mention which topic/unit the question is from. They must be jumbled.
+4. Generate a comprehensive "answer_key" alongside the questions. Every question must have an answer and a reference.
+5. Incorporate the "Specific Patterns/Constraints" into the question style (e.g., use case studies, specific focus areas).
+6. Ensure the complexity and technical depth match the "{difficulty}" difficulty level.
+7. Use the "Retrieved Study Material" as the primary source for technical details and context.
+
+Return JSON only in this exact structure:
+{{
+  "course_title": "{syllabus.get('course_title', subject_name)}",
+  "questions": {{
+    "2_marks": ["Question 1 text...", "Question 2 text..."],
+    "16_marks": ["Question 1 text...", "Question 2 text..."]
+  }},
+  "answer_key": {{
+    "2_marks": [
+      {{"answer": "Answer content...", "references": "Reference material or book..."}},
+      {{"answer": "Answer content...", "references": "Reference material or book..."}}
+    ],
+    "16_marks": [
+      {{"answer": "Answer content...", "references": "Reference material or book..."}},
+      {{"answer": "Answer content...", "references": "Reference material or book..."}}
+    ]
+  }}
+}}
+"""
+
+        raw = client.generate(prompt)
+
+        try:
+            data_out = _safe_json_loads(raw)
+        except Exception as e:
+            return jsonify({"error": str(e), "raw_output": raw}), 500
+        if isinstance(data_out, str):
+            data_out = json.loads(data_out)
+
+        import uuid
+        from datetime import datetime
+        
+        qb_id = str(uuid.uuid4())
+        qb_data = {
+            "id": qb_id,
+            "name": name,
+            "description": description,
+            "difficulty": difficulty,
+            "selected_topics": selected_topics,
+            "content": data_out,
+            "created_at": firestore.SERVER_TIMESTAMP
+        }
+
+        try:
+            # 1) Keep latest for compatibility
+            db.collection("users").document(user_id).collection("subjects").document(subject_id).update(
+                {"latest_question_bank": qb_data}
+            )
+            # 2) Save to history
+            db.collection("users").document(user_id).collection("subjects").document(subject_id).collection("question_banks").document(qb_id).set(qb_data)
+        except Exception as e:
+            logger.exception("Firestore write failed in /generate_question_bank: %s", e)
+
+        return jsonify({"reply": data_out, "id": qb_id})
+
+    except Exception as e:
+        return _error_response(e)
+
+
+def generate_assessment(client, request, collection, db):
+    """
+    Workflow:
+      1) Create empty Google Form
+      2) LLM generates valid Forms API batchUpdate 'requests' + answer_key_plan
+      3) batchUpdate with includeFormInResponse=true to extract questionIds
+      4) Attach responder URL to Classroom as ASSIGNMENT LINK
+      5) Store form_id + coursework_id + identifier_question_id + answer_key for refresh endpoint
+    """
+    try:
+        data = request.get_json() or {}
+
+        user_id = data.get("user_id")
+        subject_id = data.get("subject_id")
+        course_id = data.get("course_id")
+        user_subject_json = data.get("user_subject_json", {})
+
+        quiz_title = data.get("quiz_title")
+        quiz_description = data.get("quiz_description", "")
+        difficulty = data.get("difficulty", "medium")
+        num_questions = int(data.get("num_questions", 10))
+        points_per_question = int(data.get("points_per_question", 1))
+        shuffle_options = bool(data.get("shuffle_options", True))
+        state = data.get("state", "PUBLISHED")
+        grounded = data.get("grounded", True)
+
+        if not quiz_title:
+            return jsonify({"error": "quiz_title is required"}), 400
+        if not course_id:
+            return jsonify({"error": "course_id is required"}), 400
+
+        subject_name = user_subject_json.get("subject_name", "")
+        syllabus = user_subject_json.get("syllabus", {})
+        resources = user_subject_json.get("resources", [])
+
+        # Optional RAG
         rag_context = ""
         if resources:
             try:
                 results = collection.query(
-                    query_texts=[json.dumps(syllabus, indent=2)],
+                    query_texts=[quiz_title],
                     n_results=5,
-                    where={"resource": {"$in": resources}}  # metadata filter
+                    where={"resource": {"$in": resources}}
                 )
-
                 rag_docs = results.get("documents", [[]])[0]
                 rag_context = "\n\n".join(rag_docs)
-                print("RAG Context Retrieved ✅")
-            except Exception as e:
-                print(f"RAG fetch failed: {e}")
+            except Exception:
                 rag_context = ""
-        else:
-            rag_context = ""
 
+        grounded_text = ""
+        if grounded is False:
+            grounded_text = "If retrieved study material is empty, generate based on your current level of knowledge."
+
+        import gcr_client
+
+        # 1) Create empty form
+        created_form = gcr_client.create_form(quiz_title)
+        form_id = created_form.get("formId")
+        if not form_id:
+            return jsonify({"error": "Failed to create form (no formId)"}), 500
+
+        # 2) Prompt LLM for VALID Forms API batchUpdate payload
+        # IMPORTANT: Use the exact schema names used by Forms API (camelCase).
         prompt = f"""
-            You are an intelligent university-level teaching assistant and question paper generator.
+Return ONLY valid JSON. No markdown. No commentary.
 
-            You are given:
-            - Subject name: {subject_name}
-            - Syllabus: {json.dumps(syllabus, indent=2)}
-            - Retrieved Study Material (from resources): {rag_context} \n\n
-            - if the retrived study material is empty then generate based on your current level of knowledge
+We already created an empty Google Form titled "{quiz_title}".
+Generate a Google Forms API v1 forms.batchUpdate body content with ONLY these fields:
+- updateSettings.settings.quizSettings.isQuiz
+- updateSettings.updateMask
+- createItem.location.index
+- createItem.item.title
+- createItem.item.questionItem.question.required
+- createItem.item.questionItem.question.textQuestion.paragraph
+- createItem.item.questionItem.question.choiceQuestion.type
+- createItem.item.questionItem.question.choiceQuestion.options[].value
+- createItem.item.questionItem.question.choiceQuestion.shuffle
+- createItem.item.questionItem.question.grading.pointValue
+- createItem.item.questionItem.question.grading.correctAnswers.answers[].value
+- createItem.item.questionItem.question.whenRight.text
+- createItem.item.questionItem.question.whenWrong.text
 
-            Your task:
-            Generate a **comprehensive question bank** based on the syllabus and retrieved material.
-            Follow these rules carefully:
+STRICT RULES:
+- Do NOT invent fields (e.g., "generalAnswerKey" or any unknown keys).
+- Use only keys listed above; any extra key is invalid.
+- Return valid JSON with double quotes and NO trailing commas.
+- No code fences, no prose.
 
-            1. Cover every **unit** and **topic** in the syllabus.
-            2. Include **conceptual**, **analytical**, and **application-based** questions.
-            3. Classify questions into four categories based on marks and depth:
-            - **2 Marks:** Short, direct answer questions.
-            - **16 Marks:** In-depth, problem-solving or case study questions.
-            4. Do NOT repeat or rephrase the same idea in multiple questions.
-            5. Ensure questions are relevant, balanced, and follow academic standards.
-            6. generate 10 **2 marks** and 10 **16 marks** per unit.
+Tasks:
+A) Enable quiz mode
+B) Add ONE first question (short answer) titled "Student email" (required=true)
+C) Add EXACTLY {num_questions} multiple-choice questions (RADIO), each with exactly 4 options.
+   - IMPORTANT: You MUST generate EXACTLY {num_questions} questions. No more, no less.
+   - Number each question in the title (e.g. "1. What is...") to ensure you generate exactly {num_questions} questions.
+   - required=true
+   - shuffle options = {str(shuffle_options).lower()}
+   - grading.pointValue = {points_per_question}
+   - grading.correctAnswers.answers[0].value must match one option value EXACTLY
+   - add whenRight.text and whenWrong.text (short)
 
-            Now generate the full question bank strictly in the given format.
+Use this exact structure for quiz settings:
+{{
+  "updateSettings": {{
+    "settings": {{
+      "quizSettings": {{
+        "isQuiz": true
+      }}
+    }},
+    "updateMask": "quizSettings.isQuiz"
+  }}
+}}
 
-            Return your output strictly in this **JSON format**:
-            {{
-            "course_title": "",
-            "units": [
-                {{
-                    "unit_number": "",
-                    "unit_title": "",
-                    "2_marks": ["", "", ""],
-                    "16_marks": ["", "", ""]
-                }}
-            ]
-            }}
-        """
+Use this exact structure for creating an item:
+{{
+  "createItem": {{
+    "location": {{ "index": 0 }},
+    "item": {{
+      "title": "Question title",
+      "questionItem": {{
+        "question": {{
+          "required": true,
+          "textQuestion": {{ "paragraph": false }}
+        }}
+      }}
+    }}
+  }}
+}}
 
-        # ✅ Send to Gemini
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=prompt
+For MCQ use:
+- question.choiceQuestion.type = "RADIO"
+- question.choiceQuestion.options = [{{"value":"A"}},{{"value":"B"}},{{"value":"C"}},{{"value":"D"}}]
+- question.choiceQuestion.shuffle = true/false
+
+Return JSON with TWO keys:
+1) "requests": [ ... ]
+2) "answer_key_plan": {{
+     "mcq": [
+        {{ "mcq_index": 0, "correct": "Option text", "points": {points_per_question} }}
+     ]
+   }}
+
+Rules:
+- The first created question MUST be the short answer identifier.
+- The MCQ order after that is mcq_index 0..{num_questions-1}.
+- Keep questions strictly within the syllabus topics and avoid duplicates.
+
+Context:
+Subject: {subject_name}
+Syllabus: {json.dumps(syllabus, indent=2)}
+Retrieved: {rag_context}
+{grounded_text}
+"""
+
+        raw = client.generate(prompt)
+
+        try:
+            llm_obj = _safe_json_loads(raw)
+        except Exception as e:
+            return jsonify({"error": str(e), "raw_output": raw}), 500
+        requests_payload = llm_obj.get("requests")
+        answer_key_plan = llm_obj.get("answer_key_plan") or {}
+
+        if not isinstance(requests_payload, list) or not requests_payload:
+            return jsonify({"error": "LLM output must contain non-empty 'requests' list", "raw_output": raw}), 500
+
+        # Normalize malformed question payloads from the LLM to match Forms API schema.
+        for req in requests_payload:
+            # Normalize common snake_case keys to camelCase.
+            if isinstance(req, dict) and "create_item" in req and "createItem" not in req:
+                req["createItem"] = req.pop("create_item")
+            if isinstance(req, dict) and "update_settings" in req and "updateSettings" not in req:
+                req["updateSettings"] = req.pop("update_settings")
+
+            create_item = (req or {}).get("createItem") or {}
+            item = create_item.get("item") or {}
+            if isinstance(item, dict) and "question_item" in item and "questionItem" not in item:
+                item["questionItem"] = item.pop("question_item")
+            qitem = item.get("questionItem") or {}
+            question = qitem.get("question")
+            if not isinstance(question, dict):
+                continue
+
+            if "choice_question" in question and isinstance(question, dict):
+                question["choiceQuestion"] = question.pop("choice_question")
+
+            # Fix common mistake: feedback placed directly on question.
+            when_right = question.pop("whenRight", None)
+            when_wrong = question.pop("whenWrong", None)
+            if (when_right or when_wrong) and isinstance(question, dict):
+                q_grading = question.get("grading") or {}
+                if isinstance(q_grading, dict):
+                    if isinstance(when_right, dict):
+                        q_grading["whenRight"] = when_right
+                    if isinstance(when_wrong, dict):
+                        q_grading["whenWrong"] = when_wrong
+                question["grading"] = q_grading
+
+            # Fix common mistake: grading/feedback placed under choiceQuestion.
+            choice = question.get("choiceQuestion")
+            if isinstance(choice, dict):
+                grading = choice.pop("grading", None)
+                when_right = choice.pop("whenRight", None)
+                when_wrong = choice.pop("whenWrong", None)
+                if (grading or when_right or when_wrong) and isinstance(question, dict):
+                    q_grading = question.get("grading") or {}
+                    if isinstance(q_grading, dict):
+                        if isinstance(grading, dict):
+                            q_grading.update(grading)
+                        if isinstance(when_right, dict):
+                            q_grading["whenRight"] = when_right
+                        if isinstance(when_wrong, dict):
+                            q_grading["whenWrong"] = when_wrong
+                    question["grading"] = q_grading
+
+            # Drop any invalid keys accidentally placed on questionItem.
+            for bad_key in ("generalAnswerKey", "answerKey", "general_answer_key"):
+                qitem.pop(bad_key, None)
+
+        mcq_plan = answer_key_plan.get("mcq")
+        if not isinstance(mcq_plan, list) or len(mcq_plan) != num_questions:
+            # Try to recover from malformed LLM output by deriving from requests.
+            derived = []
+            for req in requests_payload:
+                create_item = (req or {}).get("createItem") or {}
+                item = create_item.get("item") or {}
+                qitem = item.get("questionItem") or {}
+                question = qitem.get("question") or {}
+                choice = question.get("choiceQuestion") or {}
+                grading = question.get("grading") or {}
+                correct = ((grading.get("correctAnswers") or {}).get("answers") or [{}])
+                if not choice:
+                    continue
+                correct_val = (correct[0] or {}).get("value")
+                if correct_val is None:
+                    continue
+                derived.append(
+                    {"mcq_index": len(derived), "correct": correct_val, "points": int(grading.get("pointValue", points_per_question))}
+                )
+
+            if len(derived) == 0:
+                return jsonify({
+                    "error": "answer_key_plan.mcq must be a list of length num_questions",
+                    "raw_output": raw,
+                }), 500
+
+            mcq_plan = derived
+
+        mcq_count = len(mcq_plan)
+        if mcq_count != num_questions:
+            logger.warning(
+                "LLM returned %s MCQs but request asked for %s; continuing with %s",
+                mcq_count,
+                num_questions,
+                mcq_count,
+            )
+
+        # 3) Apply batchUpdate and include form in response to extract questionIds
+        batch_resp = gcr_client.forms_batch_update_with_retries(
+            form_id=form_id,
+            requests_payload=requests_payload,
+            max_retries=4,
+            include_form_in_response=True
         )
 
-        raw = response.text.strip()
+        updated_form = (batch_resp.get("form") or {})
+        items = updated_form.get("items") or []
 
-         # Handle possible double-encoded JSON
-        try:
-            # 1️⃣ Remove Markdown code block markers like ```json ... ```
-            cleaned = re.sub(r"^```(?:json)?\s*", "", raw)
-            cleaned = re.sub(r"```$", "", cleaned).strip()
+        identifier_question_id = None
+        mcq_question_ids = []
 
-            # 2️⃣ Extract JSON body between braces
-            match = re.search(r"\{[\s\S]*\}", cleaned)
-            if not match:
-                raise ValueError("No JSON structure found in Gemini output")
+        # Extract questionIds in the order they appear
+        for it in items:
+            qi = it.get("questionItem") or {}
+            q = qi.get("question") or {}
+            qid = q.get("questionId")
+            if not qid:
+                continue
 
-            json_str = match.group(0)
+            # Identifier is first short answer with textQuestion
+            if ("textQuestion" in q) and (identifier_question_id is None):
+                identifier_question_id = qid
+            elif "choiceQuestion" in q:
+                mcq_question_ids.append(qid)
 
-            # 3️⃣ Try loading the JSON
-            data = json.loads(json_str)
+        if identifier_question_id is None:
+            return jsonify({"error": "Identifier questionId not found after batchUpdate"}), 500
+        if len(mcq_question_ids) != mcq_count:
+            return jsonify({"error": "MCQ count mismatch after batchUpdate", "got": len(mcq_question_ids), "expected": mcq_count}), 500
 
-            # 4️⃣ Handle potential double-encoded JSON strings
-            if isinstance(data, str):
-                data = json.loads(data)
+        # Build answer_key dict keyed by questionId
+        # answer_key[questionId] = { correct: "...", points: N }
+        answer_key = {}
+        # validate indices
+        idxs = sorted(int(x.get("mcq_index", -1)) for x in mcq_plan if isinstance(x, dict))
+        if idxs != list(range(mcq_count)):
+            return jsonify({"error": "mcq_index must be sequential 0..N-1", "got": idxs}), 500
 
-        except Exception as e:
-            return jsonify({
-                "error": f"Failed to parse JSON from Gemini: {str(e)}",
-                "raw_output": raw
-            }), 500
+        idx_to_plan = {int(x["mcq_index"]): x for x in mcq_plan}
+        for i, qid in enumerate(mcq_question_ids):
+            plan = idx_to_plan[i]
+            answer_key[qid] = {
+                "correct": plan.get("correct", ""),
+                "points": int(plan.get("points", points_per_question)),
+            }
 
-        db.collection("users").document(user_id) \
-            .collection("subjects").document(subject_id) \
-            .set({"question_bank": data}, merge=True)
+        # 4) Attach to Classroom as LINK assignment (reliable)
+        links = gcr_client.get_form_links(form_id)
+        responder_uri = links.get("responderUri")
+        if not responder_uri:
+            return jsonify({"error": "Missing responderUri from form"}), 500
 
-        # Return the combined result
+        max_points = mcq_count * points_per_question
+
+        coursework = gcr_client.post_quiz_assignment_link(
+            course_id=course_id,
+            title=quiz_title,
+            url=responder_uri,
+            description=quiz_description,
+            state=state,
+            max_points=max_points
+        )
+
+        coursework_id = coursework.get("id")
+
+        if user_id and subject_id:
+            try:
+                # 1) Keep latest_quiz for easy access/compatibility
+                quiz_data = {
+                    "id": coursework_id or form_id, # Use coursework_id if available
+                    "title": quiz_title,
+                    "description": quiz_description,
+                    "course_id": course_id,
+                    "coursework_id": coursework_id,
+                    "form_id": form_id,
+                    "responder_uri": responder_uri,
+                    "max_points": max_points,
+                    "identifier_question_id": identifier_question_id,
+                    "answer_key": answer_key,
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                }
+                
+                # Update the main subject doc with the latest
+                db.collection("users").document(user_id).collection("subjects").document(subject_id).update({
+                    "latest_quiz": quiz_data
+                })
+                
+                # 2) Save to historical assessments sub-collection
+                db.collection("users").document(user_id).collection("subjects").document(subject_id).collection("assessments").document(coursework_id or form_id).set(quiz_data)
+                
+            except Exception as e:
+                logger.exception("Firestore write failed in /generate_assessment: %s", e)
+
         return jsonify({
-            "reply": data,
-            "user_id": user_id,
-            "subject_id": subject_id,
-            "subject_name": subject_name,
-            "rag_context": rag_context,
-            "syllabus": syllabus
+            "ok": True,
+            "form": links,
+            "coursework": coursework,
+            "meta": {
+                "form_id": form_id,
+                "coursework_id": coursework_id,
+                "identifier_question_id": identifier_question_id,
+                "answer_key": answer_key,
+                "max_points": max_points
+            }
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
+
 
 def generate_documentation(client, request, collection, db):
     try:
         data = request.get_json()
 
-        # Extract incoming data
         user_id = data.get("user_id")
         subject_id = data.get("subject_id")
         user_subject_json = data.get("user_subject_json", {})
 
-        # Separate data
         subject_name = user_subject_json.get("subject_name", "")
         syllabus = user_subject_json.get("syllabus", {})
         resources = user_subject_json.get("resources", [])
 
-        print(f"User ID: {user_id}")
-        print(f"Subject ID: {subject_id}")
-        print(f"Resources (filters): {resources}")
-
-        # ✅ Fetch RAG context from Chroma based on resource metadata
         rag_context = ""
         if resources:
             try:
                 results = collection.query(
                     query_texts=[json.dumps(syllabus, indent=2)],
                     n_results=5,
-                    where={"resource": {"$in": resources}}  # metadata filter
+                    where={"resource": {"$in": resources}}
                 )
-
                 rag_docs = results.get("documents", [[]])[0]
                 rag_context = "\n\n".join(rag_docs)
-                print("RAG Context Retrieved ✅")
-            except Exception as e:
-                print(f"RAG fetch failed: {e}")
+            except Exception:
                 rag_context = ""
-        else:
-            rag_context = ""
 
         prompt = f"""
-            You are an expert academic content creator and university professor.
+You are an expert university professor and technical writer. Generate comprehensive, easy-to-understand study documentation for the following subject.
 
-            Your goal is to generate **comprehensive, structured subject documentation** 
+Subject: {subject_name}
+Syllabus: {json.dumps(syllabus, indent=2)}
+Retrieved Study Material: {rag_context}
 
-            You are given:
-            - Subject name: {subject_name}
-            - Syllabus: {json.dumps(syllabus, indent=2)}
-            - Retrieved Study Material (from resources): {rag_context} \n\n
-            - if the retrived study material is empty then generate based on your current level of knowledge
+Instructions:
+1. Provide a high-level overview of the course and its importance.
+2. For each unit and topic, provide:
+   - A clear, in-depth explanation of core concepts.
+   - Key formulas, definitions, or theorems where applicable.
+   - Practical examples or case studies.
+   - Real-world applications to provide context.
+   - "Common Pitfalls" - sections explaining what students usually get wrong.
+3. Ensure the tone is academic yet accessible.
+4. If study material is retrieved, prioritize its content while filling gaps with your general knowledge.
 
-            ### Task Instructions
+Return JSON only in this exact format:
+{{
+  "course_title": "string",
+  "overview": "string",
+  "units": [
+    {{
+      "unit_number": "I",
+      "unit_title": "string",
+      "topics": [
+        {{
+          "topic_title": "string",
+          "explanation": "structured text with key concepts",
+          "examples": ["e1", "e2"],
+          "real_world_applications": ["a1", "a2"],
+          "pitfalls": ["Common mistake 1", "Common mistake 2"],
+          "summary": "short recap"
+        }}
+      ],
+      "unit_summary": "short"
+    }}
+  ],
+  "final_summary": "comprehensive closing summary"
+}}
+"""
 
-            Create a **complete subject documentation** covering all units and topics in the syllabus.  
-            Ensure your content is:
-            1. **Well-organized** — divided into clear Units, Topics, and Subtopics.
-            2. **Educational** — include definitions, explanations, real-world examples, and use-cases.
-            5. **Student-friendly** — summarize key takeaways and provide short Q&A at the end of each topic.
-            6. **Comprehensive** — expand each unit into detailed conceptual and analytical content.
+        raw = client.generate(prompt)
 
-            Now generate the full question bank strictly in the given format.
-
-            Return your output strictly in this **JSON format**:
-            {{
-                "course_title": "string",
-                "overview": "string",
-                "units": [
-                    {{
-                    "unit_number": "I",
-                    "unit_title": "string",
-                    "topics": [
-                        {{
-                        "topic_title": "string",
-                        "explanation": "detailed text explanation",
-                        "examples": ["example 1", "example 2"],
-                        "real_world_applications": ["application 1", "application 2"],
-                        "summary": "short topic summary"
-                        }}
-                    ],
-                    "unit_summary": "brief overview of the unit"
-                    }}
-                ],
-                "final_summary": "concise summary of the entire subject and its importance"
-            }}
-        """
-
-        # ✅ Send to Gemini
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=prompt
-        )
-
-        raw = response.text.strip()
-
-         # Handle possible double-encoded JSON
         try:
-            # 1️⃣ Remove Markdown code block markers like ```json ... ```
-            cleaned = re.sub(r"^```(?:json)?\s*", "", raw)
-            cleaned = re.sub(r"```$", "", cleaned).strip()
-
-            # 2️⃣ Extract JSON body between braces
-            match = re.search(r"\{[\s\S]*\}", cleaned)
-            if not match:
-                raise ValueError("No JSON structure found in Gemini output")
-
-            json_str = match.group(0)
-
-            # 3️⃣ Try loading the JSON
-            data = json.loads(json_str)
-
-            # 4️⃣ Handle potential double-encoded JSON strings
-            if isinstance(data, str):
-                data = json.loads(data)
-
+            data_out = _safe_json_loads(raw)
         except Exception as e:
-            return jsonify({
-                "error": f"Failed to parse JSON from Gemini: {str(e)}",
-                "raw_output": raw
-            }), 500
+            return jsonify({"error": str(e), "raw_output": raw}), 500
+        if isinstance(data_out, str):
+            data_out = json.loads(data_out)
 
-        db.collection("users").document(user_id) \
-            .collection("subjects").document(subject_id) \
-            .set({"documentation": data}, merge=True)
+        try:
+            db.collection("users").document(user_id).collection("subjects").document(subject_id).set(
+                {"documentation": data_out}, merge=True
+            )
+        except Exception as e:
+            logger.exception("Firestore write failed in /generate_documentation: %s", e)
 
-        # Return the combined result
-        return jsonify({
-            "reply": data,
-            "user_id": user_id,
-            "subject_id": subject_id,
-            "subject_name": subject_name,
-            "rag_context": rag_context,
-            "syllabus": syllabus
-        })
+        return jsonify({"reply": data_out})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+        return _error_response(e)
