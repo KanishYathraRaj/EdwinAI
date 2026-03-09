@@ -10,6 +10,20 @@ from urllib.error import URLError
 
 logger = logging.getLogger(__name__)
 
+def _resolve_parent_doc_ref(db, user_id, parent_type, doc_id=None, doc_slug=None):
+    parent_ref = db.collection("users").document(user_id).collection(parent_type)
+    if doc_id:
+        ref = parent_ref.document(doc_id)
+        snap = ref.get()
+        if snap.exists:
+            return ref, snap, doc_id
+    if doc_slug:
+        query = parent_ref.where("slug", "==", doc_slug).limit(1).get()
+        if query:
+            snap = query[0]
+            return snap.reference, snap, snap.id
+    return None, None, None
+
 
 def _extract_json(text: str) -> str:
     cleaned = re.sub(r"^```(?:json)?\s*", "", text.strip())
@@ -93,6 +107,7 @@ def ask(client, request, collection, db):
         user_query = data.get("user_query")
         user_id = data.get("user_id")
         subject_id = data.get("subject_id")
+        parent_type = data.get("parent_type", "subjects") # subjects or batches
         user_subject_json = data.get("user_subject_json", {})
         grounded = data.get("grounded")
 
@@ -146,7 +161,7 @@ Question: {user_query}
 
         try:
             db.collection("users").document(user_id) \
-                .collection("subjects").document(subject_id) \
+                .collection(parent_type).document(subject_id) \
                 .set({"conversation_history": firestore.ArrayUnion([
                     {"role": "user", "content": user_query},
                     {"role": "assistant", "content": ai_reply}
@@ -174,6 +189,8 @@ def generate_question_bank(client, request, collection, db):
 
         user_id = data.get("user_id")
         subject_id = data.get("subject_id")
+        subject_slug = data.get("subject_slug")
+        parent_type = data.get("parent_type", "subjects")
         user_subject_json = data.get("user_subject_json", {})
         selected_topics = data.get("selected_topics", [])
         difficulty = data.get("difficulty", "Medium")
@@ -185,6 +202,19 @@ def generate_question_bank(client, request, collection, db):
         subject_name = user_subject_json.get("subject_name", "")
         syllabus = user_subject_json.get("syllabus", {})
         resources = user_subject_json.get("resources", [])
+
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+        if not subject_id and not subject_slug:
+            return jsonify({"error": "subject_id or subject_slug is required"}), 400
+        if parent_type not in {"subjects", "batches"}:
+            return jsonify({"error": "parent_type must be 'subjects' or 'batches'"}), 400
+
+        parent_doc_ref, parent_doc_snap, resolved_subject_id = _resolve_parent_doc_ref(
+            db, user_id, parent_type, subject_id, subject_slug
+        )
+        if not parent_doc_ref or not parent_doc_snap:
+            return jsonify({"error": "Parent document not found for the given identifier"}), 404
 
         rag_context = ""
         if resources:
@@ -266,15 +296,13 @@ Return JSON only in this exact structure:
 
         try:
             # 1) Keep latest for compatibility
-            db.collection("users").document(user_id).collection("subjects").document(subject_id).update(
-                {"latest_question_bank": qb_data}
-            )
+            parent_doc_ref.set({"latest_question_bank": qb_data}, merge=True)
             # 2) Save to history
-            db.collection("users").document(user_id).collection("subjects").document(subject_id).collection("question_banks").document(qb_id).set(qb_data)
+            parent_doc_ref.collection("question_banks").document(qb_id).set(qb_data)
         except Exception as e:
             logger.exception("Firestore write failed in /generate_question_bank: %s", e)
 
-        return jsonify({"reply": data_out, "id": qb_id})
+        return jsonify({"reply": data_out, "id": qb_id, "subject_id": resolved_subject_id})
 
     except Exception as e:
         return _error_response(e)
@@ -294,6 +322,7 @@ def generate_assessment(client, request, collection, db):
 
         user_id = data.get("user_id")
         subject_id = data.get("subject_id")
+        parent_type = data.get("parent_type", "subjects")
         course_id = data.get("course_id")
         user_subject_json = data.get("user_subject_json", {})
 
@@ -621,13 +650,13 @@ Retrieved: {rag_context}
                     "created_at": firestore.SERVER_TIMESTAMP,
                 }
                 
-                # Update the main subject doc with the latest
-                db.collection("users").document(user_id).collection("subjects").document(subject_id).update({
+                # Update the main parent doc with the latest
+                db.collection("users").document(user_id).collection(parent_type).document(subject_id).update({
                     "latest_quiz": quiz_data
                 })
                 
                 # 2) Save to historical assessments sub-collection
-                db.collection("users").document(user_id).collection("subjects").document(subject_id).collection("assessments").document(coursework_id or form_id).set(quiz_data)
+                db.collection("users").document(user_id).collection(parent_type).document(subject_id).collection("assessments").document(coursework_id or form_id).set(quiz_data)
                 
             except Exception as e:
                 logger.exception("Firestore write failed in /generate_assessment: %s", e)
@@ -655,6 +684,7 @@ def generate_documentation(client, request, collection, db):
 
         user_id = data.get("user_id")
         subject_id = data.get("subject_id")
+        parent_type = data.get("parent_type", "subjects")
         user_subject_json = data.get("user_subject_json", {})
 
         subject_name = user_subject_json.get("subject_name", "")
@@ -727,7 +757,7 @@ Return JSON only in this exact format:
             data_out = json.loads(data_out)
 
         try:
-            db.collection("users").document(user_id).collection("subjects").document(subject_id).set(
+            db.collection("users").document(user_id).collection(parent_type).document(subject_id).set(
                 {"documentation": data_out}, merge=True
             )
         except Exception as e:

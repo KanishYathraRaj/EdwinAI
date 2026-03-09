@@ -12,4 +12,5 @@ def upsert_resources_route():
     chroma_collection = current_app.config['CHROMA_COLLECTION']
     embedder = current_app.config['EMBEDDER']
     db = current_app.config['FIREBASE_DB']
-    return resources.upsert_resources(request, chroma_collection, embedder, db)
+    llm_client = current_app.config['LLM_CLIENT']
+    return resources.upsert_resources(request, chroma_collection, embedder, db, llm_client)

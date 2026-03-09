@@ -35,8 +35,12 @@ CREDS_FILE = os.path.join(BASE_DIR, "credentials.json")
 INTERACTIVE_AUTH = os.getenv("GCR_INTERACTIVE_AUTH", "false").lower() == "true"
 
 
-def get_creds(interactive_override: bool = False) -> Credentials:
-    """Load stored OAuth credentials or trigger the browser flow."""
+def get_creds(interactive_override: bool = False, return_url_if_needed: bool = True) -> Credentials | str:
+    """
+    Load stored OAuth credentials. 
+    If return_url_if_needed=True and auth is required, returns an auth_url (str).
+    Otherwise triggers/blocks on the browser flow and returns Credentials.
+    """
     creds: Optional[Credentials] = None
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
@@ -52,14 +56,16 @@ def get_creds(interactive_override: bool = False) -> Credentials:
                     os.unlink(TOKEN_FILE)
                 except OSError:
                     pass
-                raise
+                if return_url_if_needed:
+                    return _get_auth_url_from_flow()
+                raise RefreshError("AUTH_NEEDED")
         else:
             is_interactive = INTERACTIVE_AUTH or interactive_override
             if not is_interactive:
-                raise RefreshError(
-                    "OAuth token missing or invalid and interactive auth is disabled. "
-                    "Set GCR_INTERACTIVE_AUTH=true and re-auth, or run gcr_client.py locally."
-                )
+                if return_url_if_needed:
+                    return _get_auth_url_from_flow()
+                raise RefreshError("AUTH_NEEDED")
+            
             if not os.path.exists(CREDS_FILE):
                 raise FileNotFoundError("credentials.json not found. Download OAuth client credentials and place here.")
             flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
@@ -69,6 +75,18 @@ def get_creds(interactive_override: bool = False) -> Credentials:
             f.write(creds.to_json())
 
     return creds
+
+
+def _get_auth_url_from_flow() -> str:
+    if not os.path.exists(CREDS_FILE):
+        raise FileNotFoundError("credentials.json not found.")
+    flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
+    # Use localhost:PORT as redirect URI for run_local_server compatibility if possible
+    # but for just getting a URL, we can use a redirect_uri = 'http://localhost:8080/'
+    # However, let's keep it simple.
+    flow.redirect_uri = "http://localhost:5005/gcr/callback"
+    auth_url, _ = flow.authorization_url(prompt="consent")
+    return auth_url
 
 
 def svc_classroom(creds: Credentials):

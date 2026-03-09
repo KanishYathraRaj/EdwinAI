@@ -9,7 +9,7 @@ import tempfile
 from functools import lru_cache
 from typing import Any, Dict
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, url_for
 from googleapiclient.errors import HttpError
 from google.auth.exceptions import RefreshError
 from werkzeug.utils import secure_filename
@@ -25,7 +25,10 @@ def _cli_module():
 
 def _call(helper_name: str, *args, **kwargs):
     helper = getattr(_cli_module(), helper_name)
-    return helper(*args, **kwargs)
+    result = helper(*args, **kwargs)
+    if isinstance(result, str) and (result.startswith("http") or result == "AUTH_NEEDED"):
+        raise RefreshError(result)
+    return result
 
 
 gcr_bp = Blueprint("gcr", __name__, url_prefix="/gcr")
@@ -42,26 +45,32 @@ def _handle_http_error(err: HttpError):
 
 
 def _handle_auth_error(err: RefreshError):
-    message = {
-        "error": str(err),
+    msg = str(err)
+    auth_url = msg if msg.startswith("http") else None
+    
+    return jsonify({
+        "error": msg,
         "code": "INVALID_GRANT",
-        "hint": "OAuth token is invalid/expired. Delete token.json and re-auth via /gcr/auth (set GCR_INTERACTIVE_AUTH=true) or run gcr_client.py.",
-    }
-    return jsonify(message), 401
+        "auth_url": auth_url,
+        "hint": "Google Classroom authentication required. Please visit the auth_url to authorize the application." if auth_url else "OAuth token is invalid/expired. Please re-auth via /gcr/auth."
+    }), 401
 
 
 @gcr_bp.route("/auth", methods=["POST"])
 def trigger_auth():
     try:
+        # Use return_url_if_needed=False here because /auth IS the intent to trigger interactive flow
         creds = _call("get_creds", interactive_override=True)
+        if isinstance(creds, str):
+            return jsonify({"status": creds, "message": "Authentication flow started on backend."}), 200
     except HttpError as err:
-        logger.exception("GCR Grades Refresh: HttpError")
+        logger.exception("GCR Auth: HttpError")
         return _handle_http_error(err)
     except RefreshError as err:
-        logger.exception("GCR Grades Refresh: RefreshError")
+        logger.exception("GCR Auth: RefreshError")
         return _handle_auth_error(err)
     except Exception as exc:
-        logger.exception("GCR Grades Refresh: Unexpected Error")
+        logger.exception("GCR Auth: Unexpected Error")
         return jsonify({"error": str(exc)}), 500
 
     return jsonify(
@@ -73,19 +82,50 @@ def trigger_auth():
     )
 
 
+@gcr_bp.route("/callback")
+def auth_callback():
+    state = request.args.get("state")
+    code = request.args.get("code")
+    if not code:
+        return "Authorization failed: No code provided.", 400
+        
+    try:
+        # We need to exchange the code for tokens. 
+        # Since InstalledAppFlow.run_local_server usually does this, we'll replicate it.
+        from google_auth_oauthlib.flow import Flow
+        flow = Flow.from_client_secrets_file(
+            _cli_module().CREDS_FILE, 
+            scopes=_cli_module().SCOPES,
+            state=state
+        )
+        flow.redirect_uri = url_for("gcr.auth_callback", _external=True)
+        flow.fetch_token(code=code)
+        
+        creds = flow.credentials
+        with open(_cli_module().TOKEN_FILE, "w") as f:
+            f.write(creds.to_json())
+            
+        return "Authentication successful! You can now close this tab and return to the application.", 200
+    except Exception as e:
+        logger.exception("Auth callback error")
+        return f"Authentication failed: {str(e)}", 500
+
+
 @gcr_bp.route("/courses", methods=["GET"])
 def get_courses():
     try:
         courses = _call("list_courses")
         return jsonify({"courses": courses})
     except HttpError as err:
-        logger.exception("GCR Grades Refresh: HttpError")
+        logger.exception("GCR List Courses: HttpError")
         return _handle_http_error(err)
     except RefreshError as err:
-        logger.exception("GCR Grades Refresh: RefreshError")
+        logger.exception("GCR List Courses: RefreshError")
         return _handle_auth_error(err)
     except Exception as exc:
-        logger.exception("GCR Grades Refresh: Unexpected Error")
+        if "AUTH_NEEDED" in str(exc):
+             return _handle_auth_error(RefreshError("AUTH_NEEDED"))
+        logger.exception("GCR List Courses: Unexpected Error")
         return jsonify({"error": str(exc)}), 500
 
 

@@ -12,3 +12,10 @@ def upsert_syllabus_route():
     llm_client = current_app.config['LLM_CLIENT']
     db = current_app.config['FIREBASE_DB']
     return syllabus.upsert_syllabus(llm_client, request, db)
+
+@syllabus_bp.route("/reprocess_syllabus", methods=["POST"])
+def reprocess_syllabus_route():
+    llm_client = current_app.config['LLM_CLIENT']
+    db = current_app.config['FIREBASE_DB']
+    return syllabus.reprocess_syllabus(llm_client, request, db)
+

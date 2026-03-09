@@ -5,3 +5,4 @@ __pycache__
 token.json
 *.json.bak
 /chromaDB/
+.env
